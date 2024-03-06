@@ -1,0 +1,44 @@
+/* 基础表格样式 */
+.ag-theme-alpine-dark {
+  --ag-background-color: #1e1e1e;
+  --ag-text-color: #e0e0e0;
+  --ag-border-color: #414141;
+  --ag-header-background-color: #2a2a2a;
+  --ag-header-text-color: #e0e0e0;
+  --ag-row-hover-color: #3a3a3a;
+  --ag-row-selection-color: #2a2a2a;
+  --ag-input-background-color: #2a2a2a;
+  --ag-input-text-color: #e0e0e0;
+  --ag-input-border-color: #414141;
+}
+
+.ag-root-wrapper {
+  background-color: var(--ag-background-color);
+  color: var(--ag-text-color);
+}
+
+.ag-header-cell, .ag-header-group-cell {
+  background-color: var(--ag-header-background-color);
+  color: var(--ag-header-text-color);
+  border-color: var(--ag-border-color);
+}
+
+.ag-cell {
+  border-color: var(--ag-border-color);
+}
+
+.ag-row:hover {
+  background-color: var(--ag-row-hover-color);
+}
+
+.ag-row-selected {
+  background-color: var(--ag-row-selection-color);
+}
+
+.ag-input-textfield {
+  background-color: var(--ag-input-background-color);
+  color: var(--ag-input-text-color);
+  border-color: var(--ag-input-border-color);
+}
+
+/* 根据需要添加更多自定义样式 */
