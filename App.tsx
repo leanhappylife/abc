@@ -389,16 +389,16 @@ async function exportChangedFiles({
         });
       }
 
-      if (exportMode === 'full') {
-        if (beforePathInRepo && beforeContent !== null) {
-          const savedPath = await writeTextFile(beforeRoot, beforePathInRepo, beforeContent);
-          record.before_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-        }
+      // snapshot 和 full 两种模式都导出完整文件，
+      // 区别只在于 agent 默认如何使用这些文件。
+      if (beforePathInRepo && beforeContent !== null) {
+        const savedPath = await writeTextFile(beforeRoot, beforePathInRepo, beforeContent);
+        record.before_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
+      }
 
-        if (afterPathInRepo && afterContent !== null) {
-          const savedPath = await writeTextFile(afterRoot, afterPathInRepo, afterContent);
-          record.after_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-        }
+      if (afterPathInRepo && afterContent !== null) {
+        const savedPath = await writeTextFile(afterRoot, afterPathInRepo, afterContent);
+        record.after_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
       }
 
       if (
@@ -442,6 +442,7 @@ async function exportChangedFiles({
     },
     export_mode: exportMode,
     snapshot_lines: snapshotLines,
+    full_files_exported: true,
     files: manifestFiles,
   };
 
@@ -520,6 +521,7 @@ async function main() {
       manifest: path.join(outDir, 'manifest.json').replace(/\\/g, '/'),
       export_mode: exportMode,
       snapshot_lines: snapshotLines,
+      full_files_exported: true,
       exported_files: manifest.files.length,
     }, null, 2));
   } catch (e) {
