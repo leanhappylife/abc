@@ -529,3 +529,8 @@ async function main() {
 }
 
 main();
+
+node --check tools/github-get-pr.js
+
+node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/123"
+node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/123" --export-mode full
