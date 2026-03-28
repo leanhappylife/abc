@@ -114,7 +114,7 @@ Do not split one root issue into several smaller comments unless the fixes are c
 - Default to `--export-mode snapshot`.
 - Use `--export-mode full` only when the user explicitly asks for full code, full file comparison, all code, entire file, or equivalent wording.
 - In snapshot mode, default review context is `patch` plus `snapshot_hunks`.
-- In full mode, default review context is `patch` plus exported files under `before/` and `after/`.
+- In full mode, default review context is exported full-file comparison plus patch navigation.
 - Exported `before/` and `after/` files may exist only in full mode.
 - In snapshot mode, do not assume full files are available.
 - If snapshot context is insufficient for a reliable review, escalate to full-file comparison only for the necessary files if available.
@@ -171,9 +171,17 @@ When the user asks to review a pull request:
    - `patch`
    - `snapshot_hunks`
 
-   In full mode, also read:
-   - relevant files under `output/github/pr_review/<repo>-pr-<pull>/before/`
-   - relevant files under `output/github/pr_review/<repo>-pr-<pull>/after/`
+   In full mode:
+   - use `patch` and file metadata to rank risky files
+   - for each critical file
+   - for each deeply reviewed file
+   - for each file mentioned in a finding:
+     - read `before_exported` from the manifest entry
+     - read `after_exported` from the manifest entry
+     - resolve both as paths relative to `output/github/pr_review/<repo>-pr-<pull>/`
+     - read and compare the exported full-file contents before making the finding
+
+   Do not base deep review findings on patch text alone when resolved full-file exports are available.
 
 6. Rank changed files by production risk before deep reading.
 
@@ -247,10 +255,56 @@ Usually lower priority unless directly relevant:
 
 **Snapshot vs full review policy**
 - In snapshot mode, default to reviewing with `snapshot_hunks`.
-- In full mode, default to reviewing with full before/after files.
-- Even in snapshot mode, if a file appears high-risk and the available context is insufficient for a reliable conclusion, escalate to full-file comparison for that file only if available.
+- In full mode, default to reviewing with exported full-file `before/` and `after/` content, using patch text as a navigation aid rather than the sole evidence source.
+- For files reviewed deeply in full mode, do not rely on patch text alone when corresponding `before/` and `after/` files are available.
+- In full mode, every critical file, every deeply reviewed file, and every file mentioned in a finding should be supported by actual comparison of exported `before/` and `after/` file contents when available.
+- If full-file context is unavailable for a file in full mode, explicitly state that limitation.
 - Do not read every file deeply. Triage first.
-- If full-file context is still unavailable, explicitly state that the review is limited by available context.
+
+**Full-mode path resolution rule**
+In full mode, resolve exported full-file paths from `manifest.json`.
+
+For each file entry selected for deep review:
+- read `before_exported` and `after_exported` from the manifest
+- treat them as paths relative to `output/github/pr_review/<repo>-pr-<pull>/`
+- read and compare those resolved files before making a full-mode finding
+
+Example:
+- if `before_exported` is `before/README.md`
+- and `after_exported` is `after/README.md`
+
+then read:
+- `output/github/pr_review/<repo>-pr-<pull>/before/README.md`
+- `output/github/pr_review/<repo>-pr-<pull>/after/README.md`
+
+**Full-mode file-reading rule**
+In full mode, exported `before/` and `after/` files are required review evidence for deeply reviewed files.
+
+For each:
+- critical file
+- important file discussed in findings
+- file used to justify a blocking or non-blocking conclusion
+
+you must read and compare the corresponding exported:
+- `before/...`
+- `after/...`
+
+Do not rely on manifest entries or patch text alone for those files when full-file exports are available.
+
+**Full-mode finding evidence rule**
+In full mode, any file mentioned in a finding must be supported by actual comparison of the exported `before/` and `after/` file contents when available.
+A manifest entry, file metadata entry, or patch snippet alone is not sufficient evidence for a full-mode finding unless the issue is strictly localized and full-file context would not materially change the conclusion.
+If a finding in full mode is based only on patch text, explicitly state why full-file comparison was not needed.
+
+**Missing export handling rule**
+If `before_exported` or `after_exported` is missing, null, or unreadable for a file in full mode:
+- say so explicitly
+- do not claim full-file comparison for that file
+- fall back to patch-based reasoning only with a clear limitation note
+
+**Full-mode anti-shortcut rule**
+Do not claim a full-file review unless exported `before/` and `after/` file contents were actually read and compared for the files reviewed deeply.
+`export_mode: full` in the manifest does not by itself mean the review used full-file evidence.
 
 **Escalation rules**
 Escalate to deeper review when:
@@ -504,6 +558,7 @@ For each meaningful finding, include:
 - File
 - Risk level
 - Priority: Blocking / Non-blocking / Verify-before-merge
+- Evidence source: patch / snapshot_hunks / full before-after comparison
 - What changed
 - Why it may be wrong
 - Breaking scenario
@@ -519,6 +574,7 @@ Use these sections:
 - Mention whether review was based on snapshot context or full-file context.
 - If review depth was concentrated on the highest-risk files, say so.
 - Briefly disclose any important review limitations.
+- In full mode, explicitly list which files were reviewed with actual before/after comparison.
 
 ## Confirmed high-risk findings
 - Include only strong findings with clear evidence.
@@ -550,6 +606,11 @@ In the Summary, briefly state:
 - whether the review was snapshot-based or full-file-based
 - which files or areas received the deepest review
 - whether any critical area remained context-limited
+
+When running in full mode, also state:
+- which files were actually compared using exported `before/` and `after/` files
+- whether any high-risk file was reviewed only from patch context
+- why any high-risk file was not compared using full-file context
 
 **Pre-verdict self-check**
 Before writing the Final verdict, verify that:
@@ -597,9 +658,9 @@ Before writing the Final verdict, verify that:
     `node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/510" --export-mode full`
   - Read:
     `output/github/pr_review/my-repo-pr-510/manifest.json`
-    plus relevant files under:
-    `output/github/pr_review/my-repo-pr-510/before/`
-    `output/github/pr_review/my-repo-pr-510/after/`
+    then resolve and compare exported files from manifest entries such as:
+    - `before_exported`
+    - `after_exported`
 
 **Environment variables**
 - `GITHUB_API_BASE`
@@ -614,4 +675,5 @@ Before writing the Final verdict, verify that:
 - `manifest.json` is the review index.
 - Snapshot mode is the default because it is more token-efficient.
 - Full mode should be used when the user explicitly requests it or when deeper context is required.
-- High review quality depends on triage, risk ranking, behavior-focused analysis, disciplined evidence standards, finding prioritization, and verdict consistency.
+- In full mode, `before_exported` and `after_exported` in the manifest are path pointers, not proof that the files were already read.
+- High review quality depends on triage, risk ranking, behavior-focused analysis, disciplined evidence standards, finding prioritization, actual full-file consumption in full mode, and verdict consistency.
