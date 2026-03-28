@@ -25,6 +25,8 @@ function usage() {
   process.exit(2);
 }
 
+// Parse CLI arguments in a simple --key value format.
+// Example: --repo my-repo --pull 123
 function parseArgs() {
   const args = {};
   for (let i = 2; i < argv.length; i++) {
@@ -38,6 +40,11 @@ function parseArgs() {
   return args;
 }
 
+// Parse a GitHub PR URL and extract owner, repo, and pull number.
+// Example:
+//   https://github.company.com/my-org/my-repo/pull/123
+// becomes:
+//   { owner: 'my-org', repo: 'my-repo', pull: '123' }
 function parsePrUrl(prUrl) {
   try {
     const url = new URL(prUrl);
@@ -58,6 +65,9 @@ function parsePrUrl(prUrl) {
   }
 }
 
+// Trim a patch string so the manifest does not become too large.
+// This is only for the patch summary stored in manifest.json.
+// Full file contents are exported separately under before/ and after/.
 function trimPatch(patch, maxLen) {
   if (!patch) return null;
   maxLen = maxLen || 12000;
@@ -66,6 +76,8 @@ function trimPatch(patch, maxLen) {
     : patch;
 }
 
+// Normalize and validate a repo-relative file path before writing to disk.
+// This prevents path traversal like ../../secret.txt and strips leading slashes.
 function sanitizeRelativeFilePath(p) {
   if (!p || typeof p !== 'string') {
     throw new Error(`Invalid file path: ${p}`);
@@ -82,10 +94,17 @@ function sanitizeRelativeFilePath(p) {
   return normalized;
 }
 
+// Ensure the parent directory of a file exists before writing it.
 async function ensureDirForFile(filePath) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 }
 
+// Write text content under a root directory using a repo-relative path.
+// Example:
+//   rootDir = output/github/pr_review/my-repo-pr-123/before
+//   relPath = src/app.js
+// writes:
+//   output/github/pr_review/my-repo-pr-123/before/src/app.js
 async function writeTextFile(rootDir, relPath, content) {
   const safeRelPath = sanitizeRelativeFilePath(relPath);
   const fullPath = path.join(rootDir, safeRelPath);
@@ -94,6 +113,7 @@ async function writeTextFile(rootDir, relPath, content) {
   return fullPath;
 }
 
+// Perform a GitHub JSON API GET request and return parsed JSON.
 async function ghGet(url, token, extraHeaders = {}) {
   const headers = {
     Accept: 'application/vnd.github+json',
@@ -111,6 +131,8 @@ async function ghGet(url, token, extraHeaders = {}) {
   return res.json();
 }
 
+// Same as ghGet, but also return response headers.
+// Used for paginated endpoints, because pagination info is in the Link header.
 async function ghGetWithHeaders(url, token, extraHeaders = {}) {
   const headers = {
     Accept: 'application/vnd.github+json',
@@ -132,6 +154,9 @@ async function ghGetWithHeaders(url, token, extraHeaders = {}) {
   };
 }
 
+// Parse the GitHub Link header and return the URL for rel="next", if any.
+// Example Link header:
+//   <...page=2>; rel="next", <...page=3>; rel="last"
 function parseNextLink(linkHeader) {
   if (!linkHeader) return null;
 
@@ -146,6 +171,8 @@ function parseNextLink(linkHeader) {
   return null;
 }
 
+// Fetch all pages from a paginated GitHub endpoint and return one combined array.
+// This is mainly used for PR files because a PR may touch more than 100 files.
 async function ghGetAllPages(url, token) {
   const all = [];
   let nextUrl = url;
@@ -171,6 +198,8 @@ async function ghGetAllPages(url, token) {
   return all;
 }
 
+// Perform a GitHub raw content request and return the file as text.
+// If the file is missing for a given ref, return null instead of throwing on 404.
 async function ghGetText(url, token, extraHeaders = {}) {
   const headers = {
     Accept: 'application/vnd.github.raw',
@@ -192,6 +221,8 @@ async function ghGetText(url, token, extraHeaders = {}) {
   return res.text();
 }
 
+// Fetch file content from the GitHub contents API at a specific ref (commit SHA).
+// This is how we get the "before" and "after" file versions for a PR.
 async function fetchFileContent({ base, owner, repo, filePath, ref, token }) {
   const encodedPath = filePath
     .split('/')
@@ -202,10 +233,15 @@ async function fetchFileContent({ base, owner, repo, filePath, ref, token }) {
   return ghGetText(url, token);
 }
 
+// Decide whether a changed file status is something we can process for code review.
+// We intentionally skip unsupported statuses.
 function shouldProcessFile(file) {
   return ['added', 'modified', 'removed', 'renamed'].includes(file.status);
 }
 
+// Parse diff hunk headers from a unified patch.
+// Example hunk header:
+//   @@ -42,7 +42,9 @@
 function parsePatchHunks(patch) {
   if (!patch) return [];
 
@@ -231,14 +267,18 @@ function parsePatchHunks(patch) {
   return hunks;
 }
 
+// Split text into lines. If text is null, return an empty list.
 function splitLinesPreserve(text) {
   return text == null ? [] : text.split('\n');
 }
 
+// Clamp a number into the inclusive [min, max] range.
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+// Slice text by 1-based line range [startLine, endLine] inclusive-ish
+// according to Array.slice semantics after converting to indexes.
 function sliceLines(text, startLine, endLine) {
   const lines = splitLinesPreserve(text);
   if (lines.length === 0) return '';
@@ -248,6 +288,9 @@ function sliceLines(text, startLine, endLine) {
   return lines.slice(startIdx, endIdx).join('\n');
 }
 
+// Build token-efficient snapshot hunks for AI review.
+// For each diff hunk, include N lines before and after the changed area
+// from both the before-file and the after-file.
 function buildSnapshotHunks({
   patch,
   beforeContent,
@@ -288,6 +331,8 @@ function buildSnapshotHunks({
   });
 }
 
+// Add a few lightweight file classification flags to help the review agent
+// prioritize important files and ignore low-value noise.
 function guessFileFlags(filename) {
   const lower = filename.toLowerCase();
 
@@ -299,6 +344,11 @@ function guessFileFlags(filename) {
   };
 }
 
+// Export all changed files for the PR into a manifest plus before/after snapshots/files.
+// Notes:
+// - snapshot mode and full mode BOTH export full before/after files to disk
+// - the main difference is how the review agent is expected to use them
+// - snapshot_hunks are always generated when possible
 async function exportChangedFiles({
   base,
   owner,
@@ -319,6 +369,15 @@ async function exportChangedFiles({
     const currentPath = file.filename;
     const previousPath = file.previous_filename || null;
 
+    // For renamed files:
+    // - before path should be previous_filename
+    // - after path should be filename
+    //
+    // For added files:
+    // - there is no before path
+    //
+    // For removed files:
+    // - there is no after path
     const beforePathInRepo =
       status === 'renamed'
         ? previousPath
@@ -358,6 +417,7 @@ async function exportChangedFiles({
       let beforeContent = null;
       let afterContent = null;
 
+      // Fetch the "before" version from the PR base commit.
       if (beforePathInRepo) {
         beforeContent = await fetchFileContent({
           base,
@@ -369,6 +429,7 @@ async function exportChangedFiles({
         });
       }
 
+      // Fetch the "after" version from the PR head commit.
       if (afterPathInRepo) {
         afterContent = await fetchFileContent({
           base,
@@ -380,6 +441,7 @@ async function exportChangedFiles({
         });
       }
 
+      // Build compact review snapshots around each diff hunk.
       if (record.patch && (beforeContent !== null || afterContent !== null)) {
         record.snapshot_hunks = buildSnapshotHunks({
           patch: record.patch,
@@ -389,18 +451,20 @@ async function exportChangedFiles({
         });
       }
 
-      // snapshot 和 full 两种模式都导出完整文件，
-      // 区别只在于 agent 默认如何使用这些文件。
+      // Export full before-file for manual QA and selective escalation.
       if (beforePathInRepo && beforeContent !== null) {
         const savedPath = await writeTextFile(beforeRoot, beforePathInRepo, beforeContent);
         record.before_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
       }
 
+      // Export full after-file for manual QA and selective escalation.
       if (afterPathInRepo && afterContent !== null) {
         const savedPath = await writeTextFile(afterRoot, afterPathInRepo, afterContent);
         record.after_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
       }
 
+      // Mark the file as skipped only if we could not get either content
+      // and also could not build any snapshot hunks.
       if (
         beforeContent === null &&
         afterContent === null &&
@@ -454,6 +518,7 @@ async function exportChangedFiles({
 }
 
 async function main() {
+  // Load environment variables or tool-specific env wiring.
   loadToolEnv(argv);
 
   const args = parseArgs();
@@ -470,6 +535,7 @@ async function main() {
   let repo = args.repo;
   let pull = args.pull;
 
+  // If a PR URL is provided, extract owner/repo/pull from it.
   if (args.pr) {
     const parsed = parsePrUrl(args.pr);
     owner = parsed.owner;
@@ -492,12 +558,16 @@ async function main() {
     process.exit(2);
   }
 
-  const outDir = args.outDir || path.join('output', `${repo}-pr-${pull}`);
+  // Default output location:
+  // output/github/pr_review/<repo>-pr-<pull>/
+  const outDir =
+    args.outDir || path.join('output', 'github', 'pr_review', `${repo}-pr-${pull}`);
 
   try {
     const prUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}`;
     const filesUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}/files?per_page=100`;
 
+    // Fetch PR metadata and all changed files, including pagination.
     const [pr, files] = await Promise.all([
       ghGet(prUrl, token),
       ghGetAllPages(filesUrl, token),
@@ -515,6 +585,7 @@ async function main() {
       snapshotLines,
     });
 
+    // Print a compact machine-readable summary for callers/agents.
     console.log(JSON.stringify({
       ok: true,
       outDir,
@@ -531,8 +602,3 @@ async function main() {
 }
 
 main();
-
-node --check tools/github-get-pr.js
-
-node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/123"
-node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/123" --export-mode full
