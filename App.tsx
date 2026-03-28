@@ -1,32 +1,30 @@
-- When reviewing pull requests, always use scripts under `tools/`.
-- Always use `node tools/github-get-pr.js` to fetch PR data.
-- Always use the generated JSON file as the source of truth.
-- Never stop after running a script.
-- Never ask the user what to do next.
-- Always continue automatically to complete the review.
-
-  在 ## Instructions 下面加这段
+- When a PR URL is provided, extract `repo` and `pull` from the URL before running the command.
+- Use shell redirection to save the generated PR JSON into `output/<repo>-pr-<pull>.json`.
+- Always read the generated JSON file and continue automatically to the review.
 
 
-在 ## Tasks 下面加这整段（核心）
-### PR Review Workflow
+  ### PR Review Workflow
 
 When the user asks to review a pull request:
 
-1. Extract PR URL from the user input.
+1. Extract the PR URL from the user input.
 
-2. Execute:
-   node tools/github-get-pr.js --pr "<PR_URL>"
+2. Parse the PR URL path:
+   - repo = the segment before `pull`
+   - pull number = the segment after `pull`
 
-3. After execution:
-   - Find the generated JSON file under `output/` or `out/`
-   - Look for a line in output like:
-     Wrote output/<repo>-pr-<num>.json
-   - Use that file as input
+   Example:
+   https://github.company.com/my-org/my-repo/pull/510
+   -> repo = my-repo
+   -> pull = 510
 
-4. Read the JSON file.
+3. Execute:
+   `node tools/github-get-pr.js --pr "<PR_URL>" > "output/<repo>-pr-<pull>.json"`
 
-5. Immediately continue to review WITHOUT asking user.
+4. Read:
+   `output/<repo>-pr-<pull>.json`
+
+5. Immediately continue to review without asking the user.
 
 6. Output:
 
@@ -40,6 +38,6 @@ When the user asks to review a pull request:
 
 # Final verdict
 
-⚠️ Do NOT stop after generating JSON  
-⚠️ Do NOT ask the user for confirmation  
-⚠️ Continue automatically to review
+- Do NOT stop after generating the JSON file.
+- Do NOT ask the user what to do next.
+- Always continue automatically.
