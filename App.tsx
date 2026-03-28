@@ -296,4 +296,4 @@ async function main() {
 
 main();
 
-main();
+node tools/github-get-pr.js --pr https://你的github域名/org/repo/pull/123
