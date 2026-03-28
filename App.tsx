@@ -1,606 +1,282 @@
-#!/usr/bin/env node
-// Usage:
-//   node tools/github-get-pr.js --pr https://github.company.com/my-org/my-repo/pull/123
-//   node tools/github-get-pr.js --owner my-org --repo my-repo --pull 123
-//
-// Optional:
-//   --outDir output/custom-dir
-//   --export-mode snapshot|full   (default: snapshot)
-//   --snapshot-lines 25           (default: 25)
-
-const { argv, env, process } = require('process');
-const fs = require('fs/promises');
-const path = require('path');
-const { loadToolEnv } = require('./tool-env');
-
-function usage() {
-  console.error(
-    'Usage: github-get-pr.js --pr <pull_request_url>\n' +
-    '   or: github-get-pr.js --owner <owner> --repo <repo> --pull <pull_number>\n' +
-    'Optional:\n' +
-    '   --outDir <output_dir>\n' +
-    '   --export-mode <snapshot|full>\n' +
-    '   --snapshot-lines <number>'
-  );
-  process.exit(2);
-}
-
-// Parse CLI arguments in a simple --key value format.
-function parseArgs() {
-  const args = {};
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) {
-      const k = a.slice(2);
-      const v = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : 'true';
-      args[k] = v;
-    }
-  }
-  return args;
-}
-
-// Parse a GitHub PR URL and extract owner, repo, and pull number.
-function parsePrUrl(prUrl) {
-  try {
-    const url = new URL(prUrl);
-    const parts = url.pathname.split('/').filter(Boolean);
-    const pullIndex = parts.findIndex((p) => p === 'pull');
-
-    if (pullIndex < 2 || !parts[pullIndex + 1]) {
-      throw new Error('Not a valid PR URL');
-    }
-
-    return {
-      owner: parts[pullIndex - 2],
-      repo: parts[pullIndex - 1],
-      pull: parts[pullIndex + 1],
-    };
-  } catch (e) {
-    throw new Error(`Invalid PR URL: ${prUrl}`);
-  }
-}
-
-// Trim a patch string so the manifest does not become too large.
-function trimPatch(patch, maxLen) {
-  if (!patch) return null;
-  maxLen = maxLen || 12000;
-  return patch.length > maxLen
-    ? patch.slice(0, maxLen) + '\n...<truncated>'
-    : patch;
-}
-
-// Normalize and validate a repo-relative file path before writing to disk.
-function sanitizeRelativeFilePath(p) {
-  if (!p || typeof p !== 'string') {
-    throw new Error(`Invalid file path: ${p}`);
-  }
-
-  const normalized = p.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (
-    normalized === '' ||
-    normalized.includes('\0') ||
-    normalized.split('/').includes('..')
-  ) {
-    throw new Error(`Unsafe file path: ${p}`);
-  }
-  return normalized;
-}
-
-// Ensure the parent directory of a file exists before writing it.
-async function ensureDirForFile(filePath) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-}
-
-// Write text content under a root directory using a repo-relative path.
-async function writeTextFile(rootDir, relPath, content) {
-  const safeRelPath = sanitizeRelativeFilePath(relPath);
-  const fullPath = path.join(rootDir, safeRelPath);
-  await ensureDirForFile(fullPath);
-  await fs.writeFile(fullPath, content, 'utf8');
-  return fullPath;
-}
-
-// Ensure we only delete paths under output/github/pr_review.
-function ensureSafeOutputDir(outDir) {
-  const normalized = path.resolve(outDir);
-  const allowedRoot = path.resolve(path.join('output', 'github', 'pr_review'));
-
-  if (
-    normalized !== allowedRoot &&
-    !normalized.startsWith(allowedRoot + path.sep)
-  ) {
-    throw new Error(`Refusing to delete unsafe output directory: ${outDir}`);
-  }
-
-  return normalized;
-}
-
-// Remove the existing output directory if it already exists,
-// then recreate it as an empty directory.
-async function resetOutputDir(outDir) {
-  const safeDir = ensureSafeOutputDir(outDir);
-  await fs.rm(safeDir, { recursive: true, force: true });
-  await fs.mkdir(safeDir, { recursive: true });
-}
-
-// Perform a GitHub JSON API GET request and return parsed JSON.
-async function ghGet(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub request failed: ${res.status} ${text}`);
-  }
-
-  return res.json();
-}
-
-// Same as ghGet, but also return response headers for pagination.
-async function ghGetWithHeaders(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub request failed: ${res.status} ${text}`);
-  }
-
-  const data = await res.json();
-  return {
-    data,
-    headers: res.headers,
-  };
-}
-
-// Parse the GitHub Link header and return the URL for rel="next", if any.
-function parseNextLink(linkHeader) {
-  if (!linkHeader) return null;
-
-  const parts = linkHeader.split(',');
-  for (const part of parts) {
-    const section = part.trim();
-    const match = section.match(/^<([^>]+)>\s*;\s*rel="([^"]+)"$/);
-    if (match && match[2] === 'next') {
-      return match[1];
-    }
-  }
-  return null;
-}
-
-// Fetch all pages from a paginated GitHub endpoint and return one combined array.
-async function ghGetAllPages(url, token) {
-  const all = [];
-  let nextUrl = url;
-  let pageCount = 0;
-  const maxPages = 100;
-
-  while (nextUrl) {
-    pageCount += 1;
-    if (pageCount > maxPages) {
-      throw new Error(`Too many pages when fetching GitHub data, exceeded ${maxPages}`);
-    }
-
-    const { data, headers } = await ghGetWithHeaders(nextUrl, token);
-
-    if (!Array.isArray(data)) {
-      throw new Error('Expected paginated GitHub API response to be an array');
-    }
-
-    all.push(...data);
-    nextUrl = parseNextLink(headers.get('link'));
-  }
-
-  return all;
-}
-
-// Perform a GitHub raw content request and return the file as text.
-async function ghGetText(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github.raw',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (res.status === 404) {
-    return null;
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub raw request failed: ${res.status} ${text}`);
-  }
-
-  return res.text();
-}
-
-// Fetch file content from the GitHub contents API at a specific ref (commit SHA).
-async function fetchFileContent({ base, owner, repo, filePath, ref, token }) {
-  const encodedPath = filePath
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/');
-
-  const url = `${base}/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`;
-  return ghGetText(url, token);
-}
-
-// Decide whether a changed file status is something we can process for review.
-function shouldProcessFile(file) {
-  return ['added', 'modified', 'removed', 'renamed'].includes(file.status);
-}
-
-// Parse diff hunk headers from a unified patch.
-function parsePatchHunks(patch) {
-  if (!patch) return [];
-
-  const lines = patch.split('\n');
-  const hunks = [];
-  let current = null;
-
-  for (const line of lines) {
-    const m = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
-    if (m) {
-      if (current) hunks.push(current);
-      current = {
-        hunk_header: line,
-        before_line: Number(m[1]),
-        before_count: m[2] ? Number(m[2]) : 1,
-        after_line: Number(m[3]),
-        after_count: m[4] ? Number(m[4]) : 1,
-      };
-    }
-  }
-
-  if (current) hunks.push(current);
-  return hunks;
-}
-
-// Split text into lines. If text is null, return an empty list.
-function splitLinesPreserve(text) {
-  return text == null ? [] : text.split('\n');
-}
-
-// Clamp a number into the inclusive [min, max] range.
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-// Slice text by 1-based line range [startLine, endLine].
-function sliceLines(text, startLine, endLine) {
-  const lines = splitLinesPreserve(text);
-  if (lines.length === 0) return '';
-
-  const startIdx = clamp(startLine - 1, 0, lines.length);
-  const endIdx = clamp(endLine, 0, lines.length);
-  return lines.slice(startIdx, endIdx).join('\n');
-}
-
-// Build token-efficient snapshot hunks for AI review.
-function buildSnapshotHunks({
-  patch,
-  beforeContent,
-  afterContent,
-  snapshotLines,
-}) {
-  const hunks = parsePatchHunks(patch);
-  const beforeTotal = splitLinesPreserve(beforeContent).length;
-  const afterTotal = splitLinesPreserve(afterContent).length;
-
-  return hunks.map((h) => {
-    const beforeCount = Math.max(h.before_count, 1);
-    const afterCount = Math.max(h.after_count, 1);
-
-    const beforeStart = beforeTotal === 0
-      ? null
-      : clamp(h.before_line - snapshotLines, 1, Math.max(beforeTotal, 1));
-    const beforeEnd = beforeTotal === 0
-      ? null
-      : clamp(h.before_line + beforeCount - 1 + snapshotLines, 1, Math.max(beforeTotal, 1));
-
-    const afterStart = afterTotal === 0
-      ? null
-      : clamp(h.after_line - snapshotLines, 1, Math.max(afterTotal, 1));
-    const afterEnd = afterTotal === 0
-      ? null
-      : clamp(h.after_line + afterCount - 1 + snapshotLines, 1, Math.max(afterTotal, 1));
-
-    return {
-      hunk_header: h.hunk_header,
-      before_start: beforeStart,
-      before_end: beforeEnd,
-      after_start: afterStart,
-      after_end: afterEnd,
-      before_snapshot: beforeStart == null ? null : sliceLines(beforeContent, beforeStart, beforeEnd),
-      after_snapshot: afterStart == null ? null : sliceLines(afterContent, afterStart, afterEnd),
-    };
-  });
-}
-
-// Add a few lightweight file classification flags.
-function guessFileFlags(filename) {
-  const lower = filename.toLowerCase();
-
-  return {
-    is_test_file: /(^|\/)(test|tests|__tests__)\/|(\.test\.|\.(spec)\.)/.test(lower),
-    is_lock_file: /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/.test(lower),
-    is_generated_file: /(^|\/)(dist|build|coverage)\//.test(lower),
-    is_docs_file: /\.(md|txt|rst)$/.test(lower),
-  };
-}
-
-// Export all changed files for the PR into a manifest.
-// snapshot mode:
-// - generates snapshot_hunks
-// - does not export before/after files
-//
-// full mode:
-// - exports before/after files
-// - does not generate snapshot_hunks
-async function exportChangedFiles({
-  base,
-  owner,
-  repo,
-  pr,
-  files,
-  token,
-  outDir,
-  exportMode,
-  snapshotLines,
-}) {
-  const beforeRoot = path.join(outDir, 'before');
-  const afterRoot = path.join(outDir, 'after');
-  const manifestFiles = [];
-
-  for (const file of files) {
-    const status = file.status;
-    const currentPath = file.filename;
-    const previousPath = file.previous_filename || null;
-
-    const beforePathInRepo =
-      status === 'renamed'
-        ? previousPath
-        : (status === 'added' ? null : currentPath);
-
-    const afterPathInRepo =
-      status === 'removed'
-        ? null
-        : currentPath;
-
-    const record = {
-      filename: currentPath,
-      previous_filename: previousPath,
-      status,
-      additions: file.additions,
-      deletions: file.deletions,
-      changes: file.changes,
-      patch: trimPatch(file.patch),
-      before_ref: pr.base.sha,
-      after_ref: pr.head.sha,
-      before_repo_path: beforePathInRepo,
-      after_repo_path: afterPathInRepo,
-      skipped_reason: null,
-      ...guessFileFlags(currentPath),
-    };
-
-    if (exportMode === 'snapshot') {
-      record.snapshot_hunks = [];
-    }
-
-    if (exportMode === 'full') {
-      record.before_exported = null;
-      record.after_exported = null;
-    }
-
-    if (!shouldProcessFile(file)) {
-      record.skipped_reason = `unsupported status: ${status}`;
-      manifestFiles.push(record);
-      continue;
-    }
-
-    try {
-      let beforeContent = null;
-      let afterContent = null;
-
-      if (beforePathInRepo) {
-        beforeContent = await fetchFileContent({
-          base,
-          owner,
-          repo,
-          filePath: beforePathInRepo,
-          ref: pr.base.sha,
-          token,
-        });
-      }
-
-      if (afterPathInRepo) {
-        afterContent = await fetchFileContent({
-          base,
-          owner,
-          repo,
-          filePath: afterPathInRepo,
-          ref: pr.head.sha,
-          token,
-        });
-      }
-
-      if (
-        exportMode === 'snapshot' &&
-        record.patch &&
-        (beforeContent !== null || afterContent !== null)
-      ) {
-        record.snapshot_hunks = buildSnapshotHunks({
-          patch: record.patch,
-          beforeContent,
-          afterContent,
-          snapshotLines,
-        });
-      }
-
-      if (exportMode === 'full') {
-        if (beforePathInRepo && beforeContent !== null) {
-          const savedPath = await writeTextFile(beforeRoot, beforePathInRepo, beforeContent);
-          record.before_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-        }
-
-        if (afterPathInRepo && afterContent !== null) {
-          const savedPath = await writeTextFile(afterRoot, afterPathInRepo, afterContent);
-          record.after_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-        }
-      }
-
-      if (exportMode === 'snapshot') {
-        if (!record.snapshot_hunks || record.snapshot_hunks.length === 0) {
-          record.skipped_reason = 'content not available or snapshot could not be generated';
-        }
-      }
-
-      if (exportMode === 'full') {
-        if (beforeContent === null && afterContent === null) {
-          record.skipped_reason = 'content not available or non-text/binary file';
-        }
-      }
-    } catch (e) {
-      record.skipped_reason = e && e.message ? e.message : String(e);
-    }
-
-    manifestFiles.push(record);
-  }
-
-  const manifest = {
-    repo: {
-      owner,
-      repo,
-    },
-    pr: {
-      number: pr.number,
-      title: pr.title,
-      body: pr.body || '',
-      state: pr.state,
-      user: pr.user && pr.user.login,
-      base: {
-        ref: pr.base && pr.base.ref,
-        sha: pr.base && pr.base.sha,
-      },
-      head: {
-        ref: pr.head && pr.head.ref,
-        sha: pr.head && pr.head.sha,
-      },
-      additions: pr.additions,
-      deletions: pr.deletions,
-      changed_files: pr.changed_files,
-      commits: pr.commits,
-      html_url: pr.html_url,
-    },
-    export_mode: exportMode,
-    review_context:
-      exportMode === 'snapshot'
-        ? 'patch_and_snapshot_hunks'
-        : 'patch_and_full_files',
-    snapshot_lines: exportMode === 'snapshot' ? snapshotLines : null,
-    files: manifestFiles,
-  };
-
-  const manifestPath = path.join(outDir, 'manifest.json');
-  await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-
-  return manifest;
-}
-
-async function main() {
-  loadToolEnv(argv);
-
-  const args = parseArgs();
-
-  const base = env.GITHUB_API_BASE;
-  const token = env.GITHUB_TOKEN || env.GITHUB_API_TOKEN;
-
-  if (!base) {
-    console.error('Missing GITHUB_API_BASE');
-    process.exit(3);
-  }
-
-  let owner = args.owner;
-  let repo = args.repo;
-  let pull = args.pull;
-
-  if (args.pr) {
-    const parsed = parsePrUrl(args.pr);
-    owner = parsed.owner;
-    repo = parsed.repo;
-    pull = parsed.pull;
-  }
-
-  if (!owner || !repo || !pull) usage();
-
-  const exportMode = args['export-mode'] || 'snapshot';
-  const snapshotLines = Number(args['snapshot-lines'] || 25);
-
-  if (!['snapshot', 'full'].includes(exportMode)) {
-    console.error(`Invalid --export-mode: ${exportMode}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(snapshotLines) || snapshotLines < 0 || snapshotLines > 200) {
-    console.error(`Invalid --snapshot-lines: ${snapshotLines}`);
-    process.exit(2);
-  }
-
-  const outDir =
-    args.outDir || path.join('output', 'github', 'pr_review', `${repo}-pr-${pull}`);
-
-  try {
-    await resetOutputDir(outDir);
-
-    const prUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}`;
-    const filesUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}/files?per_page=100`;
-
-    const [pr, files] = await Promise.all([
-      ghGet(prUrl, token),
-      ghGetAllPages(filesUrl, token),
-    ]);
-
-    const manifest = await exportChangedFiles({
-      base,
-      owner,
-      repo,
-      pr,
-      files,
-      token,
-      outDir,
-      exportMode,
-      snapshotLines,
-    });
-
-    console.log(JSON.stringify({
-      ok: true,
-      outDir,
-      manifest: path.join(outDir, 'manifest.json').replace(/\\/g, '/'),
-      export_mode: exportMode,
-      review_context:
-        exportMode === 'snapshot'
-          ? 'patch_and_snapshot_hunks'
-          : 'patch_and_full_files',
-      snapshot_lines: exportMode === 'snapshot' ? snapshotLines : null,
-      exported_files: manifest.files.length,
-    }, null, 2));
-  } catch (e) {
-    console.error('Request error', e && e.message ? e.message : e);
-    process.exit(4);
-  }
-}
-
-main();
+---
+name: Github
+description: Handle GitHub pull request review workflows and cross-repository GitHub read/search tasks.
+argument-hint: For example: "review pr <PR_URL>" or "review pr <PR_URL> with all code".
+tools: ['execute', 'read', 'search']
+---
+
+**Scope boundary (mandatory)**
+- This agent is limited to asking/answering questions and creating/modifying documentation, diagrams, and data artifacts.
+- Allowed write targets: `output/**` only.
+- Never create, modify, or delete repository source code, automation scripts, test files, build files, workflow files, dependency manifests, or lockfiles.
+- If a request requires tool/script/code changes, stop and ask the user to use a coding agent.
+
+**URL access policy (mandatory)**
+- Any URL/network access must go through repository scripts under `tools/` only.
+- Do not use direct URL methods such as `curl`, `wget`, raw browser commands, or ad-hoc network calls.
+- If URL opening is required, use repository tooling only.
+
+**Role**
+Act as a senior code reviewer for pull requests.
+Your primary job is to find correctness bugs, regression risks, unsafe behavior changes, missing validation, error-handling problems, async/concurrency issues, data integrity risks, and important test gaps.
+Do not behave like a generic summarizer. Behave like a careful reviewer.
+
+**Core review principles**
+- Review for **correctness first**, not style first.
+- Review for **behavior change**, not only diff syntax.
+- Prefer **fewer high-confidence findings** over many weak or speculative comments.
+- Focus on what can break in production.
+- Do not waste attention on minor stylistic nits unless there are no meaningful risks.
+- Treat business logic, security, data access, state transitions, async flow, and validation as higher priority than formatting or naming.
+- When uncertain, clearly label uncertainty instead of overstating conclusions.
+
+**Instructions**
+- When reviewing pull requests, always use scripts under `tools/`.
+- When a PR URL is provided, extract `repo` and `pull` from the URL before running the command.
+- Always use `node tools/github-get-pr.js` to fetch PR data.
+- The PR files API may be paginated; always rely on `tools/github-get-pr.js` to fetch all changed files across all pages before starting the review.
+- Always export PR review artifacts into `output/github/pr_review/<repo>-pr-<pull>/`.
+- Always read the generated manifest file and continue automatically to the review.
+- Treat `output/github/pr_review/<repo>-pr-<pull>/manifest.json` as the source-of-truth manifest for the PR export.
+- Default to `--export-mode snapshot`.
+- Use `--export-mode full` only when the user explicitly asks for full code, full file comparison, all code, entire file, or equivalent wording.
+- In snapshot mode, default review context is `patch` plus `snapshot_hunks`.
+- In full mode, default review context is `patch` plus exported files under `before/` and `after/`.
+- Exported `before/` and `after/` files may exist only in full mode.
+- In snapshot mode, do not assume full files are available.
+- If snapshot context is insufficient for a reliable review, escalate to full-file comparison only for the necessary files.
+- Never stop after running a script.
+- Never ask the user what to do next.
+- Always continue automatically to complete the review.
+
+**Primary review objectives**
+In priority order, review for:
+1. Correctness bugs
+2. Regression risk
+3. Data integrity issues
+4. Security/auth/permission issues
+5. API contract and backward compatibility issues
+6. Async flow / concurrency / retry / idempotency issues
+7. Error handling and rollback issues
+8. Validation / null / empty / edge-case behavior
+9. Missing or weak tests
+10. Maintainability issues that materially affect correctness
+
+**Tasks**
+### PR Review Workflow
+
+When the user asks to review a pull request:
+
+1. Extract the PR URL from the user input.
+
+2. Parse the PR URL path:
+   - `repo` = the segment before `pull`
+   - `pull` number = the segment after `pull`
+
+   Example:
+   `https://github.company.com/my-org/my-repo/pull/510`
+   -> repo = `my-repo`
+   -> pull = `510`
+
+3. Determine export mode:
+   - If the user says `with all code`, `full code`, `full file`, `entire file`, or equivalent, use `full`.
+   - Otherwise use `snapshot`.
+
+4. Execute:
+
+   Snapshot mode:
+   `node tools/github-get-pr.js --pr "<PR_URL>" --export-mode snapshot`
+
+   Full mode:
+   `node tools/github-get-pr.js --pr "<PR_URL>" --export-mode full`
+
+5. Read:
+   - `output/github/pr_review/<repo>-pr-<pull>/manifest.json`
+
+   In snapshot mode, review using:
+   - `patch`
+   - `snapshot_hunks`
+
+   In full mode, also read:
+   - relevant files under `output/github/pr_review/<repo>-pr-<pull>/before/`
+   - relevant files under `output/github/pr_review/<repo>-pr-<pull>/after/`
+
+6. Immediately continue to review without asking the user.
+
+7. Output sections in this order:
+   - Summary
+   - Confirmed high-risk findings
+   - Possible risks / needs verification
+   - Medium / low-risk findings
+   - Test gaps
+   - Final verdict
+
+- Do NOT stop after generating the manifest file.
+- Do NOT ask the user what to do next.
+- Always continue automatically.
+
+**Review strategy**
+- Start from `manifest.json`.
+- Use file metadata, patch, and review context to rank changed files by risk before reading more context.
+- Spend the most attention on files that can change production behavior.
+- Skip or heavily down-rank low-value files unless directly relevant.
+
+**High-priority files and changes**
+Prioritize deeper review for:
+- Authentication / authorization / permission checks
+- Security-sensitive code
+- Payment / billing / balances / money movement
+- Order / booking / workflow state transitions
+- Database queries / repositories / transactions
+- Migrations / schema changes / data model changes
+- API controllers / request handlers / response shaping
+- Caching / invalidation / consistency logic
+- Retry / idempotency / deduplication logic
+- Background jobs / schedulers / async orchestration
+- Validation / sanitization / parsing
+- Feature flags / fallback logic / kill switches
+- Exception handling / rollback / compensation logic
+
+**Low-priority files**
+Usually lower priority unless directly relevant:
+- Lock files
+- Generated files
+- Build artifacts
+- Pure documentation changes
+- Formatting-only changes
+- Snapshot files with no real behavioral implication
+
+**Snapshot vs full review policy**
+- In snapshot mode, default to reviewing with `snapshot_hunks`.
+- In full mode, default to reviewing with full before/after files.
+- Even in snapshot mode, if a file appears high-risk and the available context is insufficient for a reliable conclusion, escalate to full-file comparison for that file only if available.
+- Do not read every file deeply. Triage first.
+
+**Per-file review guidance**
+For each changed file:
+- Understand what behavior changed.
+- Compare before vs after behavior, not just line edits.
+- Look for:
+  - deleted guards
+  - weakened validation
+  - changed conditionals
+  - changed defaults
+  - changed null/empty handling
+  - changed exception behavior
+  - changed return values
+  - changed retries / idempotency
+  - changed transactional scope
+  - changed async ordering / awaiting
+  - changed external API assumptions
+  - changed state transitions
+- For renamed files, compare old path and new path appropriately.
+- Distinguish between code that is merely different and code that is more likely wrong.
+
+**What to check explicitly**
+Always consider whether the PR may break:
+- happy path behavior
+- null / undefined / empty input paths
+- error paths
+- retry paths
+- concurrent execution paths
+- backward compatibility
+- existing callers / existing payload contracts
+- state consistency after partial failure
+
+**Escalation rules**
+Escalate to deeper review when:
+- patch context is not enough to understand a function or behavior
+- there are multiple hunks in the same logical unit
+- the change touches transactions, retries, auth, or persistence
+- deleted code appears to remove protections
+- exception handling changes
+- return or response behavior changes
+- state transitions change
+- a patch looks deceptively small but may affect broad behavior
+
+**Output quality rules**
+- Prefer high-confidence findings.
+- Avoid flooding the output with weak guesses.
+- Separate confirmed issues from possible risks.
+- If no serious issue is found, say so clearly.
+- If evidence is incomplete, say what would need verification.
+
+**Required finding format**
+For each meaningful finding, include:
+- File
+- Risk level
+- What changed
+- Why it may be wrong
+- Breaking scenario
+- Recommended check or fix
+- Confidence
+
+**Expected output style**
+Use these sections:
+
+## Summary
+- Briefly state what the PR appears to change.
+- Mention overall risk level.
+- Mention whether review was based on snapshot context or full-file context.
+
+## Confirmed high-risk findings
+- Include only strong findings with clear evidence.
+
+## Possible risks / needs verification
+- Include issues that look plausible but need more context or runtime confirmation.
+
+## Medium / low-risk findings
+- Include only meaningful items, not trivial nits.
+
+## Test gaps
+- Point out important missing tests.
+- Prefer behavior-oriented tests over superficial ones.
+
+## Final verdict
+Choose one of:
+- Safe to merge with no major concerns
+- Probably safe but should verify listed risks
+- Needs changes before merge
+- High risk; do not merge yet
+
+**Do not do these**
+- Do not focus on style before correctness.
+- Do not produce long lists of cosmetic nits.
+- Do not pretend uncertain concerns are confirmed bugs.
+- Do not rely only on patch text when important context is missing.
+- Do not review every file equally.
+- Do not stop after export.
+- Do not ask the user what to do next.
+
+**Examples**
+- User: `review pr https://github.company.com/my-org/my-repo/pull/510`
+  - Use:
+    `node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/510" --export-mode snapshot`
+  - Read:
+    `output/github/pr_review/my-repo-pr-510/manifest.json`
+  - Default review context:
+    `patch` + `snapshot_hunks`
+
+- User: `review pr https://github.company.com/my-org/my-repo/pull/510 with all code`
+  - Use:
+    `node tools/github-get-pr.js --pr "https://github.company.com/my-org/my-repo/pull/510" --export-mode full`
+  - Read:
+    `output/github/pr_review/my-repo-pr-510/manifest.json`
+    plus relevant files under:
+    `output/github/pr_review/my-repo-pr-510/before/`
+    `output/github/pr_review/my-repo-pr-510/after/`
+
+**Environment variables**
+- `GITHUB_API_BASE`
+- `GITHUB_TOKEN` or `GITHUB_API_TOKEN`
+
+**Environment loading**
+- Node tools may auto-load `.env` via repository tooling.
+- Use repository-supported environment loading only.
+- Avoid exposing secrets in untrusted shells.
+
+**Notes**
+- `manifest.json` is the review index.
+- Snapshot mode is the default because it is more token-efficient.
+- Full mode should be used when the user explicitly requests it or when deeper context is required.
+- High review quality depends on triage, risk ranking, and behavior-focused analysis.
