@@ -113,6 +113,30 @@ async function writeTextFile(rootDir, relPath, content) {
   return fullPath;
 }
 
+// Ensure we only delete paths under output/github/pr_review.
+// This prevents accidental deletion of unrelated directories.
+function ensureSafeOutputDir(outDir) {
+  const normalized = path.resolve(outDir);
+  const allowedRoot = path.resolve(path.join('output', 'github', 'pr_review'));
+
+  if (
+    normalized !== allowedRoot &&
+    !normalized.startsWith(allowedRoot + path.sep)
+  ) {
+    throw new Error(`Refusing to delete unsafe output directory: ${outDir}`);
+  }
+
+  return normalized;
+}
+
+// Remove the existing output directory if it already exists,
+// then recreate it as an empty directory.
+async function resetOutputDir(outDir) {
+  const safeDir = ensureSafeOutputDir(outDir);
+  await fs.rm(safeDir, { recursive: true, force: true });
+  await fs.mkdir(safeDir, { recursive: true });
+}
+
 // Perform a GitHub JSON API GET request and return parsed JSON.
 async function ghGet(url, token, extraHeaders = {}) {
   const headers = {
@@ -564,6 +588,10 @@ async function main() {
     args.outDir || path.join('output', 'github', 'pr_review', `${repo}-pr-${pull}`);
 
   try {
+    // Clear any previous export for the same PR to avoid mixing stale files
+    // with newly exported manifest/before/after content.
+    await resetOutputDir(outDir);
+
     const prUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}`;
     const filesUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}/files?per_page=100`;
 
