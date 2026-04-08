@@ -1,956 +1,718 @@
-#!/usr/bin/env node
-// Usage:
-//   node tools/github-get-pr.js --pr https://github.company.com/my-org/my-repo/pull/123
-//   node tools/github-get-pr.js --owner my-org --repo my-repo --pull 123
-//
-// Optional:
-//   --outDir output/custom-dir
-//   --export-mode snapshot|full        (default: snapshot)
-//   --snapshot-lines 25                (default: 25)
-//   --full-snippet-lines 60            (default: 60)
-//   --head-lines 80                    (default: 80)
-//   --tail-lines 40                    (default: 40)
-//   --max-embed-bytes 200000           (default: 200000)
-
-const { argv, env, process } = require('process');
-const fs = require('fs/promises');
-const path = require('path');
-const { loadToolEnv } = require('./tool-env');
-
-/**
- * Print CLI usage and exit.
- */
-function usage() {
-  console.error(
-    'Usage: github-get-pr.js --pr <pull_request_url>\n' +
-    '   or: github-get-pr.js --owner <owner> --repo <repo> --pull <pull_number>\n' +
-    'Optional:\n' +
-    '   --outDir <output_dir>\n' +
-    '   --export-mode <snapshot|full>\n' +
-    '   --snapshot-lines <number>\n' +
-    '   --full-snippet-lines <number>\n' +
-    '   --head-lines <number>\n' +
-    '   --tail-lines <number>\n' +
-    '   --max-embed-bytes <number>'
-  );
-  process.exit(2);
-}
-
-/**
- * Parse CLI arguments in a simple --key value format.
- * Example:
- *   --repo my-repo --pull 123
- */
-function parseArgs() {
-  const args = {};
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) {
-      const k = a.slice(2);
-      const v = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : 'true';
-      args[k] = v;
-    }
-  }
-  return args;
-}
-
-/**
- * Parse a GitHub PR URL and extract owner, repo, and pull number.
- * Example:
- *   https://github.company.com/my-org/my-repo/pull/123
- * becomes:
- *   { owner: 'my-org', repo: 'my-repo', pull: '123' }
- */
-function parsePrUrl(prUrl) {
-  try {
-    const url = new URL(prUrl);
-    const parts = url.pathname.split('/').filter(Boolean);
-    const pullIndex = parts.findIndex((p) => p === 'pull');
-
-    if (pullIndex < 2 || !parts[pullIndex + 1]) {
-      throw new Error('Not a valid PR URL');
-    }
-
-    return {
-      owner: parts[pullIndex - 2],
-      repo: parts[pullIndex - 1],
-      pull: parts[pullIndex + 1],
-    };
-  } catch (e) {
-    throw new Error(`Invalid PR URL: ${prUrl}`);
-  }
-}
-
-/**
- * Trim a patch string so manifest.json does not become too large.
- * This only affects the patch summary stored in the manifest.
- * Full file contents are still exported separately.
- */
-function trimPatch(patch, maxLen) {
-  if (!patch) return null;
-  maxLen = maxLen || 12000;
-  return patch.length > maxLen
-    ? patch.slice(0, maxLen) + '\n...<truncated>'
-    : patch;
-}
-
-/**
- * Normalize and validate a repo-relative file path before writing to disk.
- * This prevents path traversal such as ../../secret.txt.
- */
-function sanitizeRelativeFilePath(p) {
-  if (!p || typeof p !== 'string') {
-    throw new Error(`Invalid file path: ${p}`);
-  }
-
-  const normalized = p.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (
-    normalized === '' ||
-    normalized.includes('\0') ||
-    normalized.split('/').includes('..')
-  ) {
-    throw new Error(`Unsafe file path: ${p}`);
-  }
-  return normalized;
-}
-
-/**
- * Ensure the parent directory for a file path exists.
- */
-async function ensureDirForFile(filePath) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-}
-
-/**
- * Write text content under a root directory using a repo-relative path.
- * Example:
- *   rootDir = output/github/pr_review/my-repo-pr-123/before
- *   relPath = src/app.js
- * writes:
- *   output/github/pr_review/my-repo-pr-123/before/src/app.js
- */
-async function writeTextFile(rootDir, relPath, content) {
-  const safeRelPath = sanitizeRelativeFilePath(relPath);
-  const fullPath = path.join(rootDir, safeRelPath);
-  await ensureDirForFile(fullPath);
-  await fs.writeFile(fullPath, content, 'utf8');
-  return fullPath;
-}
-
-/**
- * Ensure deletion is limited to output/github/pr_review only.
- * This prevents accidental deletion of unrelated directories.
- */
-function ensureSafeOutputDir(outDir) {
-  const normalized = path.resolve(outDir);
-  const allowedRoot = path.resolve(path.join('output', 'github', 'pr_review'));
-
-  if (
-    normalized !== allowedRoot &&
-    !normalized.startsWith(allowedRoot + path.sep)
-  ) {
-    throw new Error(`Refusing to delete unsafe output directory: ${outDir}`);
-  }
-
-  return normalized;
-}
-
-/**
- * Remove the existing output directory if present, then recreate it.
- * This prevents stale exports from mixing with the new run.
- */
-async function resetOutputDir(outDir) {
-  const safeDir = ensureSafeOutputDir(outDir);
-  await fs.rm(safeDir, { recursive: true, force: true });
-  await fs.mkdir(safeDir, { recursive: true });
-}
-
-/**
- * Perform a GitHub JSON API GET request and return parsed JSON.
- */
-async function ghGet(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub request failed: ${res.status} ${text}`);
-  }
-
-  return res.json();
-}
-
-/**
- * Same as ghGet, but also return response headers.
- * This is useful for paginated endpoints because pagination info is in Link.
- */
-async function ghGetWithHeaders(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub request failed: ${res.status} ${text}`);
-  }
-
-  const data = await res.json();
-  return {
-    data,
-    headers: res.headers,
-  };
-}
-
-/**
- * Parse the GitHub Link header and return the URL for rel="next", if any.
- * Example:
- *   <...page=2>; rel="next", <...page=3>; rel="last"
- */
-function parseNextLink(linkHeader) {
-  if (!linkHeader) return null;
-
-  const parts = linkHeader.split(',');
-  for (const part of parts) {
-    const section = part.trim();
-    const match = section.match(/^<([^>]+)>\s*;\s*rel="([^"]+)"$/);
-    if (match && match[2] === 'next') {
-      return match[1];
-    }
-  }
-  return null;
-}
-
-/**
- * Fetch all pages from a paginated GitHub endpoint and return one combined array.
- * This is mainly needed for PR files because a PR may touch more than 100 files.
- */
-async function ghGetAllPages(url, token) {
-  const all = [];
-  let nextUrl = url;
-  let pageCount = 0;
-  const maxPages = 100;
-
-  while (nextUrl) {
-    pageCount += 1;
-    if (pageCount > maxPages) {
-      throw new Error(`Too many pages when fetching GitHub data, exceeded ${maxPages}`);
-    }
-
-    const { data, headers } = await ghGetWithHeaders(nextUrl, token);
-
-    if (!Array.isArray(data)) {
-      throw new Error('Expected paginated GitHub API response to be an array');
-    }
-
-    all.push(...data);
-    nextUrl = parseNextLink(headers.get('link'));
-  }
-
-  return all;
-}
-
-/**
- * Perform a GitHub raw-content request and return the file as text.
- * Return null on 404 so callers can treat missing content gracefully.
- */
-async function ghGetText(url, token, extraHeaders = {}) {
-  const headers = {
-    Accept: 'application/vnd.github.raw',
-    ...extraHeaders,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers });
-
-  if (res.status === 404) {
-    return null;
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub raw request failed: ${res.status} ${text}`);
-  }
-
-  return res.text();
-}
-
-/**
- * Fetch file content from the GitHub contents API at a specific ref.
- * This is how we get the "before" and "after" file versions for a PR.
- */
-async function fetchFileContent({ base, owner, repo, filePath, ref, token }) {
-  const encodedPath = filePath
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/');
-
-  const url = `${base}/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`;
-  return ghGetText(url, token);
-}
-
-/**
- * Decide whether a changed file status is supported for export/review.
- */
-function shouldProcessFile(file) {
-  return ['added', 'modified', 'removed', 'renamed'].includes(file.status);
-}
-
-/**
- * Parse diff hunk headers from a unified patch.
- * Example hunk header:
- *   @@ -42,7 +42,9 @@
- */
-function parsePatchHunks(patch) {
-  if (!patch) return [];
-
-  const lines = patch.split('\n');
-  const hunks = [];
-  let current = null;
-
-  for (const line of lines) {
-    const m = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
-    if (m) {
-      if (current) hunks.push(current);
-      current = {
-        hunk_header: line,
-        before_line: Number(m[1]),
-        before_count: m[2] ? Number(m[2]) : 1,
-        after_line: Number(m[3]),
-        after_count: m[4] ? Number(m[4]) : 1,
-      };
-    }
-  }
-
-  if (current) hunks.push(current);
-  return hunks;
-}
-
-/**
- * Split text into lines.
- * Return an empty array when the input is null.
- */
-function splitLinesPreserve(text) {
-  return text == null ? [] : text.split('\n');
-}
-
-/**
- * Clamp a number into the inclusive [min, max] range.
- */
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-/**
- * Slice text by 1-based line range.
- * endLine is treated in a way that matches Array.slice behavior after conversion.
- */
-function sliceLines(text, startLine, endLine) {
-  const lines = splitLinesPreserve(text);
-  if (lines.length === 0) return '';
-
-  const startIdx = clamp(startLine - 1, 0, lines.length);
-  const endIdx = clamp(endLine, 0, lines.length);
-  return lines.slice(startIdx, endIdx).join('\n');
-}
-
-/**
- * Return the last N lines from a text block.
- */
-function sliceTailLines(text, lineCount) {
-  const lines = splitLinesPreserve(text);
-  if (lines.length === 0) return '';
-  const start = Math.max(lines.length - lineCount, 0);
-  return lines.slice(start).join('\n');
-}
-
-/**
- * Build token-efficient diff-hunk snippets for review.
- * For each patch hunk, include N surrounding lines from both before/after versions.
- */
-function buildSnapshotHunks({
-  patch,
-  beforeContent,
-  afterContent,
-  snapshotLines,
-}) {
-  const hunks = parsePatchHunks(patch);
-  const beforeTotal = splitLinesPreserve(beforeContent).length;
-  const afterTotal = splitLinesPreserve(afterContent).length;
-
-  return hunks.map((h) => {
-    const beforeCount = Math.max(h.before_count, 1);
-    const afterCount = Math.max(h.after_count, 1);
-
-    const beforeStart = beforeTotal === 0
-      ? null
-      : clamp(h.before_line - snapshotLines, 1, Math.max(beforeTotal, 1));
-    const beforeEnd = beforeTotal === 0
-      ? null
-      : clamp(h.before_line + beforeCount - 1 + snapshotLines, 1, Math.max(beforeTotal, 1));
-
-    const afterStart = afterTotal === 0
-      ? null
-      : clamp(h.after_line - snapshotLines, 1, Math.max(afterTotal, 1));
-    const afterEnd = afterTotal === 0
-      ? null
-      : clamp(h.after_line + afterCount - 1 + snapshotLines, 1, Math.max(afterTotal, 1));
-
-    return {
-      kind: 'diff_hunk',
-      hunk_header: h.hunk_header,
-      before_start: beforeStart,
-      before_end: beforeEnd,
-      after_start: afterStart,
-      after_end: afterEnd,
-      before_snippet: beforeStart == null ? null : sliceLines(beforeContent, beforeStart, beforeEnd),
-      after_snippet: afterStart == null ? null : sliceLines(afterContent, afterStart, afterEnd),
-    };
-  });
-}
-
-/**
- * Add lightweight classification flags.
- * These help the review agent prioritize higher-value files.
- */
-function guessFileFlags(filename) {
-  const lower = filename.toLowerCase();
-
-  return {
-    is_test_file: /(^|\/)(test|tests|__tests__)\/|(\.test\.|\.(spec)\.)/.test(lower),
-    is_lock_file: /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|cargo\.lock|composer\.lock|gemfile\.lock)$/i.test(lower),
-    is_generated_file: /(^|\/)(dist|build|coverage|target|out|generated|node_modules)\//.test(lower),
-    is_docs_file: /\.(md|txt|rst|adoc)$/i.test(lower),
-  };
-}
-
-/**
- * Compute UTF-8 byte length of a string.
- */
-function utf8ByteLength(text) {
-  return text == null ? 0 : Buffer.byteLength(text, 'utf8');
-}
-
-/**
- * Decide whether the full before/after content should be embedded into manifest.json.
- * In full mode, only smaller and higher-value files are embedded.
- */
-function shouldEmbedManifestContent({
-  exportMode,
-  fileFlags,
-  beforeContent,
-  afterContent,
-  maxEmbedBytes,
-}) {
-  if (exportMode !== 'full') {
-    return {
-      embed: false,
-      reason: 'export_mode_is_not_full',
-    };
-  }
-
-  if (fileFlags.is_lock_file) {
-    return {
-      embed: false,
-      reason: 'lock_file',
-    };
-  }
-
-  if (fileFlags.is_generated_file) {
-    return {
-      embed: false,
-      reason: 'generated_file',
-    };
-  }
-
-  if (fileFlags.is_docs_file) {
-    return {
-      embed: false,
-      reason: 'docs_file',
-    };
-  }
-
-  const beforeBytes = utf8ByteLength(beforeContent);
-  const afterBytes = utf8ByteLength(afterContent);
-  const largest = Math.max(beforeBytes, afterBytes);
-
-  if (largest > maxEmbedBytes) {
-    return {
-      embed: false,
-      reason: `file_too_large_over_${maxEmbedBytes}_bytes`,
-    };
-  }
-
-  return {
-    embed: true,
-    reason: null,
-  };
-}
-
-/**
- * Decide whether fallback snippets should be generated.
- * Low-value files like lock/generated files can be excluded to reduce noise.
- */
-function shouldUseSnippets(fileFlags) {
-  if (fileFlags.is_lock_file) {
-    return {
-      use: false,
-      reason: 'lock_file',
-    };
-  }
-
-  if (fileFlags.is_generated_file) {
-    return {
-      use: false,
-      reason: 'generated_file',
-    };
-  }
-
-  return {
-    use: true,
-    reason: null,
-  };
-}
-
-/**
- * Build richer snippets for manifest embedding when full-file embedding is skipped.
- * The snippet set includes:
- * - file head
- * - file tail
- * - expanded diff hunks
- */
-function buildEmbeddedSnippets({
-  patch,
-  beforeContent,
-  afterContent,
-  snippetLines,
-  headLines,
-  tailLines,
-}) {
-  const snippets = [];
-
-  if (beforeContent != null || afterContent != null) {
-    snippets.push({
-      kind: 'file_head',
-      before_start: beforeContent == null ? null : 1,
-      before_end: beforeContent == null ? null : Math.min(splitLinesPreserve(beforeContent).length, headLines),
-      after_start: afterContent == null ? null : 1,
-      after_end: afterContent == null ? null : Math.min(splitLinesPreserve(afterContent).length, headLines),
-      before_snippet: beforeContent == null ? null : sliceLines(beforeContent, 1, headLines),
-      after_snippet: afterContent == null ? null : sliceLines(afterContent, 1, headLines),
-    });
-
-    snippets.push({
-      kind: 'file_tail',
-      before_start: beforeContent == null
-        ? null
-        : Math.max(splitLinesPreserve(beforeContent).length - tailLines + 1, 1),
-      before_end: beforeContent == null ? null : splitLinesPreserve(beforeContent).length,
-      after_start: afterContent == null
-        ? null
-        : Math.max(splitLinesPreserve(afterContent).length - tailLines + 1, 1),
-      after_end: afterContent == null ? null : splitLinesPreserve(afterContent).length,
-      before_snippet: beforeContent == null ? null : sliceTailLines(beforeContent, tailLines),
-      after_snippet: afterContent == null ? null : sliceTailLines(afterContent, tailLines),
-    });
-  }
-
-  const diffSnippets = buildSnapshotHunks({
-    patch,
-    beforeContent,
-    afterContent,
-    snapshotLines: snippetLines,
-  });
-
-  snippets.push(...diffSnippets);
-
-  return snippets;
-}
-
-/**
- * Export all changed PR files into:
- * - manifest.json
- * - before/ full file copies
- * - after/ full file copies
- *
- * Content strategy:
- * - full mode:
- *   small/high-value files -> embed full content in manifest
- *   larger files -> embed snippets instead
- * - snapshot mode:
- *   embed snippets only
- */
-async function exportChangedFiles({
-  base,
-  owner,
-  repo,
-  pr,
-  files,
-  token,
-  outDir,
-  exportMode,
-  snapshotLines,
-  fullSnippetLines,
-  headLines,
-  tailLines,
-  maxEmbedBytes,
-}) {
-  const beforeRoot = path.join(outDir, 'before');
-  const afterRoot = path.join(outDir, 'after');
-  const manifestFiles = [];
-
-  for (const file of files) {
-    const status = file.status;
-    const currentPath = file.filename;
-    const previousPath = file.previous_filename || null;
-    const fileFlags = guessFileFlags(currentPath);
-
-    // For renamed files:
-    // - before path uses previous_filename
-    // - after path uses filename
-    //
-    // For added files:
-    // - no before version exists
-    //
-    // For removed files:
-    // - no after version exists
-    const beforePathInRepo =
-      status === 'renamed'
-        ? previousPath
-        : (status === 'added' ? null : currentPath);
-
-    const afterPathInRepo =
-      status === 'removed'
-        ? null
-        : currentPath;
-
-    const record = {
-      filename: currentPath,
-      previous_filename: previousPath,
-      status,
-      additions: file.additions,
-      deletions: file.deletions,
-      changes: file.changes,
-      patch: trimPatch(file.patch),
-      before_ref: pr.base.sha,
-      after_ref: pr.head.sha,
-      before_repo_path: beforePathInRepo,
-      after_repo_path: afterPathInRepo,
-      before_exported: null,
-      after_exported: null,
-
-      // manifest_content_mode:
-      // - full: full before/after content embedded
-      // - snippets: snippet fallback embedded
-      // - none: metadata only, no embedded content
-      manifest_content_mode: 'none',
-      before_content: null,
-      after_content: null,
-      embedded_snippets: [],
-      manifest_content_embedded: false,
-      manifest_content_skipped_reason: null,
-
-      // snapshot_hunks is kept for backward compatibility and quick review access.
-      snapshot_hunks: [],
-      skipped_reason: null,
-      ...fileFlags,
-    };
-
-    if (!shouldProcessFile(file)) {
-      record.skipped_reason = `unsupported status: ${status}`;
-      manifestFiles.push(record);
-      continue;
-    }
-
-    try {
-      let beforeContent = null;
-      let afterContent = null;
-
-      // Fetch the before version from the PR base commit SHA.
-      if (beforePathInRepo) {
-        beforeContent = await fetchFileContent({
-          base,
-          owner,
-          repo,
-          filePath: beforePathInRepo,
-          ref: pr.base.sha,
-          token,
-        });
-      }
-
-      // Fetch the after version from the PR head commit SHA.
-      if (afterPathInRepo) {
-        afterContent = await fetchFileContent({
-          base,
-          owner,
-          repo,
-          filePath: afterPathInRepo,
-          ref: pr.head.sha,
-          token,
-        });
-      }
-
-      // Always build compact hunk snapshots when possible.
-      if (record.patch && (beforeContent !== null || afterContent !== null)) {
-        record.snapshot_hunks = buildSnapshotHunks({
-          patch: record.patch,
-          beforeContent,
-          afterContent,
-          snapshotLines,
-        });
-      }
-
-      // Decide whether full content should be embedded directly into manifest.json.
-      const embedDecision = shouldEmbedManifestContent({
-        exportMode,
-        fileFlags,
-        beforeContent,
-        afterContent,
-        maxEmbedBytes,
-      });
-
-      if (embedDecision.embed) {
-        record.before_content = beforeContent;
-        record.after_content = afterContent;
-        record.manifest_content_mode = 'full';
-        record.manifest_content_embedded = true;
-      } else {
-        // If full embedding is skipped, optionally downgrade to snippets.
-        const snippetDecision = shouldUseSnippets(fileFlags);
-
-        if (snippetDecision.use) {
-          const snippetLines = exportMode === 'full' ? fullSnippetLines : snapshotLines;
-
-          record.embedded_snippets = buildEmbeddedSnippets({
-            patch: record.patch,
-            beforeContent,
-            afterContent,
-            snippetLines,
-            headLines,
-            tailLines,
-          });
-
-          record.manifest_content_mode = 'snippets';
-          record.manifest_content_skipped_reason = embedDecision.reason;
-        } else {
-          record.manifest_content_mode = 'none';
-          record.manifest_content_skipped_reason = snippetDecision.reason || embedDecision.reason;
-        }
-      }
-
-      // Export the full before file to disk for manual QA and fallback reading.
-      if (beforePathInRepo && beforeContent !== null) {
-        const savedPath = await writeTextFile(beforeRoot, beforePathInRepo, beforeContent);
-        record.before_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-      }
-
-      // Export the full after file to disk for manual QA and fallback reading.
-      if (afterPathInRepo && afterContent !== null) {
-        const savedPath = await writeTextFile(afterRoot, afterPathInRepo, afterContent);
-        record.after_exported = path.relative(outDir, savedPath).replace(/\\/g, '/');
-      }
-
-      // Mark as skipped only when nothing useful could be fetched or built.
-      if (
-        beforeContent === null &&
-        afterContent === null &&
-        (!record.snapshot_hunks || record.snapshot_hunks.length === 0)
-      ) {
-        record.skipped_reason = 'content not available or non-text/binary file';
-      }
-    } catch (e) {
-      record.skipped_reason = e && e.message ? e.message : String(e);
-    }
-
-    manifestFiles.push(record);
-  }
-
-  const fullCount = manifestFiles.filter((f) => f.manifest_content_mode === 'full').length;
-  const snippetCount = manifestFiles.filter((f) => f.manifest_content_mode === 'snippets').length;
-  const noneCount = manifestFiles.filter((f) => f.manifest_content_mode === 'none').length;
-
-  const manifest = {
-    repo: {
-      owner,
-      repo,
-    },
-    pr: {
-      number: pr.number,
-      title: pr.title,
-      body: pr.body || '',
-      state: pr.state,
-      user: pr.user && pr.user.login,
-      base: {
-        ref: pr.base && pr.base.ref,
-        sha: pr.base && pr.base.sha,
-      },
-      head: {
-        ref: pr.head && pr.head.ref,
-        sha: pr.head && pr.head.sha,
-      },
-      additions: pr.additions,
-      deletions: pr.deletions,
-      changed_files: pr.changed_files,
-      commits: pr.commits,
-      html_url: pr.html_url,
-    },
-    export_mode: exportMode,
-    snapshot_lines: snapshotLines,
-    full_snippet_lines: fullSnippetLines,
-    head_lines: headLines,
-    tail_lines: tailLines,
-    max_embed_bytes: maxEmbedBytes,
-    full_files_exported: true,
-    manifest_content_summary: {
-      full: fullCount,
-      snippets: snippetCount,
-      none: noneCount,
-    },
-    files: manifestFiles,
-  };
-
-  const manifestPath = path.join(outDir, 'manifest.json');
-  await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-
-  return manifest;
-}
-
-/**
- * Main entry point.
- * Responsibilities:
- * - load environment
- * - parse CLI args
- * - validate options
- * - fetch PR metadata and files
- * - export results
- * - print machine-readable summary
- */
-async function main() {
-  loadToolEnv(argv);
-
-  const args = parseArgs();
-
-  const base = env.GITHUB_API_BASE;
-  const token = env.GITHUB_TOKEN || env.GITHUB_API_TOKEN;
-
-  if (!base) {
-    console.error('Missing GITHUB_API_BASE');
-    process.exit(3);
-  }
-
-  let owner = args.owner;
-  let repo = args.repo;
-  let pull = args.pull;
-
-  // If a PR URL is provided, derive owner/repo/pull from it.
-  if (args.pr) {
-    const parsed = parsePrUrl(args.pr);
-    owner = parsed.owner;
-    repo = parsed.repo;
-    pull = parsed.pull;
-  }
-
-  if (!owner || !repo || !pull) usage();
-
-  const exportMode = args['export-mode'] || 'snapshot';
-  const snapshotLines = Number(args['snapshot-lines'] || 25);
-  const fullSnippetLines = Number(args['full-snippet-lines'] || 60);
-  const headLines = Number(args['head-lines'] || 80);
-  const tailLines = Number(args['tail-lines'] || 40);
-  const maxEmbedBytes = Number(args['max-embed-bytes'] || 200000);
-
-  if (!['snapshot', 'full'].includes(exportMode)) {
-    console.error(`Invalid --export-mode: ${exportMode}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(snapshotLines) || snapshotLines < 0 || snapshotLines > 200) {
-    console.error(`Invalid --snapshot-lines: ${snapshotLines}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(fullSnippetLines) || fullSnippetLines < 0 || fullSnippetLines > 400) {
-    console.error(`Invalid --full-snippet-lines: ${fullSnippetLines}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(headLines) || headLines < 0 || headLines > 400) {
-    console.error(`Invalid --head-lines: ${headLines}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(tailLines) || tailLines < 0 || tailLines > 400) {
-    console.error(`Invalid --tail-lines: ${tailLines}`);
-    process.exit(2);
-  }
-
-  if (!Number.isInteger(maxEmbedBytes) || maxEmbedBytes < 0) {
-    console.error(`Invalid --max-embed-bytes: ${maxEmbedBytes}`);
-    process.exit(2);
-  }
-
-  // Default output location:
-  // output/github/pr_review/<repo>-pr-<pull>/
-  const outDir =
-    args.outDir || path.join('output', 'github', 'pr_review', `${repo}-pr-${pull}`);
-
-  try {
-    // Clear old output first so the export stays deterministic.
-    await resetOutputDir(outDir);
-
-    const prUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}`;
-    const filesUrl = `${base}/repos/${owner}/${repo}/pulls/${pull}/files?per_page=100`;
-
-    // Fetch PR metadata and all changed files in parallel.
-    const [pr, files] = await Promise.all([
-      ghGet(prUrl, token),
-      ghGetAllPages(filesUrl, token),
-    ]);
-
-    const manifest = await exportChangedFiles({
-      base,
-      owner,
-      repo,
-      pr,
-      files,
-      token,
-      outDir,
-      exportMode,
-      snapshotLines,
-      fullSnippetLines,
-      headLines,
-      tailLines,
-      maxEmbedBytes,
-    });
-
-    // Print a compact machine-readable summary for callers/agents.
-    console.log(JSON.stringify({
-      ok: true,
-      outDir,
-      manifest: path.join(outDir, 'manifest.json').replace(/\\/g, '/'),
-      export_mode: exportMode,
-      snapshot_lines: snapshotLines,
-      full_snippet_lines: fullSnippetLines,
-      head_lines: headLines,
-      tail_lines: tailLines,
-      max_embed_bytes: maxEmbedBytes,
-      full_files_exported: true,
-      manifest_content_summary: manifest.manifest_content_summary,
-      exported_files: manifest.files.length,
-    }, null, 2));
-  } catch (e) {
-    console.error('Request error', e && e.message ? e.message : e);
-    process.exit(4);
-  }
-}
-
-main();
+# relationship_detail.tsv — revised semantics and filling matrix (DB2-focused, schema-aware)
+
+This document is the **semantic contract** for generating and validating `relationship_detail.tsv`.
+
+It is intended to stay aligned with the current sample SQL and TSV, but it is **authoritative over the TSV** when the two diverge. Any mismatch between this document and a generated TSV should be treated as a defect in either:
+- the extractor / parser / post-processor, or
+- this contract itself.
+
+## Core principle
+
+Each row records **one direct, single-hop relationship** found in a source SQL object.
+
+The core meaning of a row must be readable from these main columns:
+- `source_object_type`
+- `source_object`
+- `source_field`
+- `target_object_type`
+- `target_object`
+- `target_field`
+- `relationship`
+- `line_no`
+- `line_relation_seq`
+- `line_content`
+
+`persistent_target_objects` and `intermediate_target_objects` are auxiliary **target-side classification** columns for the current direct relationship row. They indicate whether the row's target lands on a persistent target or an intermediate target. They do **not** represent full propagated lineage impact, do **not** represent a full intermediate path, and do **not** change the semantic meaning of the row.
+
+## General extraction rules
+
+### Directness
+Only emit **direct single-hop** relationships.
+Do **not** collapse multi-hop propagation into one row.
+
+Examples:
+- `A -> V1` and `V1 -> T1` are two direct rows, not one inferred `A -> T1` row.
+- `FUNCTION_EXPR_MAP` captures that a function result is used in an assignment expression; it does not replace argument lineage into the function itself.
+
+### Exact source fidelity
+- `line_no` must be the **exact physical source line number** from the SQL file.
+- `line_content` must be the **exact original raw source line** from the SQL file.
+- If a row's semantics are correct but the `line_no` or `line_content` is wrong, the row is still considered defective.
+
+### Schema-aware expansion
+The extractor may use schema/catalog metadata (DDL or live database metadata) to resolve:
+- object types
+- column ownership
+- `SELECT *` expansion
+- named function/procedure parameters
+- target-column alignment for `INSERT ... SELECT` and `MERGE`
+
+If required schema metadata is unavailable:
+- prefer a weaker but truthful row set,
+- or emit lower-confidence fallback rows,
+- but do **not** invent columns or parameter names.
+
+## Literal, special register, and system-value rule
+
+Ensure field-level lineage captures literals and DB2 system-derived values wherever they directly participate in SQL semantics.
+
+### Canonical token form
+Use:
+
+- `CONSTANT:<VALUE>` for literals and DB2 special registers/system constants  
+  Examples:
+  - `CONSTANT:'ACTIVE'`
+  - `CONSTANT:1`
+  - `CONSTANT:NULL`
+  - `CONSTANT:CURRENT TIMESTAMP`
+  - `CONSTANT:CURRENT DATE`
+  - `CONSTANT:USER`
+
+### Where literal/system tokens are allowed
+Literal/system tokens may appear in `source_field` for:
+- `SELECT_EXPR`
+- `INSERT_SELECT_MAP`
+- `UPDATE_SET`
+- `UPDATE_SET_MAP`
+- `MERGE_SET_MAP`
+- `MERGE_INSERT_MAP`
+- `VARIABLE_SET_MAP`
+- `FUNCTION_PARAM_MAP`
+- `CALL_PARAM_MAP`
+- `SPECIAL_REGISTER_MAP`
+- `DIAGNOSTICS_FETCH_MAP`
+- `RETURN_VALUE`
+- `WHERE`
+- `JOIN_ON`
+- `HAVING`
+- `CONTROL_FLOW_CONDITION`
+
+### Relationship choice precedence
+- Use `SPECIAL_REGISTER_MAP` for DB2 special-register assignment/mapping into a target column or variable when that is the most specific meaning.
+- Use `DIAGNOSTICS_FETCH_MAP` for diagnostic-state fetches.
+- Otherwise use the context-appropriate generic relationship (`INSERT_SELECT_MAP`, `UPDATE_SET_MAP`, `SELECT_EXPR`, `RETURN_VALUE`, etc.).
+
+## Column semantics
+
+### `source_object_type`
+Type of the SQL source object that owns the row.
+
+Common values:
+- `VIEW_DDL`
+- `FUNCTION`
+- `PROCEDURE`
+- `SCRIPT`
+
+### `source_object`
+Owning SQL object name.
+
+Examples:
+- `INTERFACE.V_API_MTM_REVAL`
+- `INTERFACE.FN_GET_CODE_MAP_VALUE`
+- `INTERFACE.PI_API_MTM_REVAL_DEMO`
+- `EXTRA_PATTERNS`
+
+### `source_field`
+Primary source-side token for field-level relationships.
+
+Rules:
+- Field-level rows: populate with the direct source or participating token.
+- Object-level rows: leave empty.
+- If the source is a literal or DB2 special register/system value, use `CONSTANT:<VALUE>`.
+- For callable-parameter mappings:
+  - `FUNCTION_PARAM_MAP` / `CALL_PARAM_MAP` use the actual argument token in `source_field`.
+- For `FUNCTION_EXPR_MAP`, use the called function name in `source_field`.
+
+### `target_object_type`
+Resolved object type on the right side of the direct relationship.
+
+Common values:
+- `TABLE`
+- `VIEW`
+- `SESSION_TABLE`
+- `CTE`
+- `FUNCTION`
+- `PROCEDURE`
+- `CURSOR`
+- `VARIABLE`
+- `UNKNOWN`
+
+### `target_object`
+Resolved object on the right side of the direct relationship.
+
+Rules:
+- Use the real resolved object whenever possible.
+- For unresolved placeholders, use a stable placeholder that matches the unresolved class:
+  - `UNKNOWN_DYNAMIC_SQL` for unresolved dynamic SQL text
+  - `UNKNOWN_UNSUPPORTED_STATEMENT` for unsupported but recognized statements such as utilities/admin commands
+  - `UNKNOWN_UNRESOLVED_OBJECT` for syntactically parseable cases whose real object cannot be resolved
+
+### `target_field`
+Resolved field / slot on the right side of the direct relationship.
+
+Rules:
+- Field-level rows: populate with the concrete target / participating field.
+- Object-level rows: leave empty.
+- For assignment-slot relationships (`UPDATE_SET`, `UPDATE_SET_MAP`, etc.), this is the target column or variable receiving the value.
+- For parameter-mapping relationships, use the **formal parameter name** when known; otherwise use a positional slot like `$1`, `$2`, ...
+
+### `relationship`
+One of the allowed relationship types defined below.
+
+### `line_no`
+Exact physical source line number.
+
+### `line_relation_seq`
+Stable per-line sequence number within the same source object.
+
+Rules:
+- Partition by (`source_object_type`, `source_object`, `line_no`)
+- Number from `0`
+- If a source line produces only one relationship row, use `0`
+- This is a **line-level** sequence only. It does **not** number the whole SQL statement across multiple lines.
+- The sequence must follow the **natural SQL relationship order on that line**, not a generic dictionary sort.
+
+Natural SQL ordering rules:
+1. Keep original left-to-right SQL appearance order whenever the line itself provides clear positional order.
+2. For ordered slot relationships, preserve statement slot order:
+   - `INSERT_TARGET_COL`: target-column declaration order inside `INSERT (...)`
+   - `INSERT_SELECT_MAP`, `TABLE_FUNCTION_RETURN_MAP`: select-item / mapping slot order
+   - `UPDATE_TARGET_COL`: `SET` target assignment order
+   - `UPDATE_SET_MAP`: target assignment order, then source-expression appearance order if more than one direct source participates
+   - `MERGE_TARGET_COL`, `MERGE_SET_MAP`, `MERGE_INSERT_MAP`: branch-local target / mapping slot order
+   - `CREATE_VIEW_MAP`: view select-list order
+   - `FUNCTION_PARAM_MAP`, `CALL_PARAM_MAP`: callable argument order
+   - `VARIABLE_SET_MAP`, `SPECIAL_REGISTER_MAP`, `DIAGNOSTICS_FETCH_MAP`, `FUNCTION_EXPR_MAP`: target assignment / slot order
+3. For direct field-usage and predicate rows, preserve token appearance order on the source line:
+   - `SELECT_FIELD`, `SELECT_EXPR`, `WHERE`, `JOIN_ON`, `GROUP_BY`, `HAVING`, `ORDER_BY`, `MERGE_MATCH`, `UPDATE_SET`, `CONTROL_FLOW_CONDITION`, `RETURN_VALUE`
+4. For object-level rows, preserve statement encounter order on that line:
+   - `SELECT_TABLE`, `SELECT_VIEW`, `INSERT_TABLE`, `UPDATE_TABLE`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `MERGE_INTO`, `CALL_FUNCTION`, `CALL_PROCEDURE`, `CTE_DEFINE`, `CTE_READ`, `UNION_INPUT`, `CREATE_VIEW`, `CREATE_TABLE`, `CREATE_PROCEDURE`, `CREATE_FUNCTION`, `UNKNOWN`, `CURSOR_DEFINE`, `CURSOR_READ`, `DYNAMIC_SQL_EXEC`, `EXCEPTION_HANDLER_MAP`
+5. Only use a deterministic fallback sort when the parser cannot recover meaningful natural order. In that fallback case, sort by:
+   `relationship`, `target_object_type`, `target_object`, `target_field`, `source_field`, `line_content`
+
+### `line_content`
+Exact original raw source line from the SQL file.
+
+### `persistent_target_objects`
+Auxiliary **target-side classification** column for the current direct relationship row.
+
+Meaning:
+- Identifies that the current row's **target side** is a persistent landing target.
+- This column does **not** mean full downstream impact.
+- This column does **not** mean the final propagated endpoint of a larger lineage chain.
+- This column does **not** replace mapping semantics in `relationship`.
+- This column does **not** connect separate direct rows together.
+
+Population rules:
+- Populate this column only when the current row's `target_object_type` is a persistent entity such as `TABLE` or `VIEW`, or `UNKNOWN` that truthfully represents a persistent target.
+- Treat this column primarily as a **target-landing tag**. It is most useful when the row itself already expresses a clear landing target.
+- **Preferred population cases:**
+  - mapping rows (`*_MAP`), because the row already means `source -> target`
+  - target-column declaration rows (`*_TARGET_COL`)
+  - object write / create rows such as `INSERT_TABLE`, `UPDATE_TABLE`, `MERGE_INTO`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `CREATE_TABLE`, `CREATE_VIEW`, `CREATE_FUNCTION`, `CREATE_PROCEDURE`
+  - return / output rows when the target side is persistent
+- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than target landing. This includes:
+  - `SELECT_FIELD`
+  - `SELECT_EXPR`
+  - `WHERE`
+  - `JOIN_ON`
+  - `GROUP_BY`
+  - `HAVING`
+  - `ORDER_BY`
+  - `MERGE_MATCH`
+  - `UPDATE_SET`
+  - `CONTROL_FLOW_CONDITION`
+- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
+
+Format:
+- `target_object.target_field` when `target_field` is present
+- otherwise `target_object`
+
+### `intermediate_target_objects`
+Auxiliary **target-side classification** column for the current direct relationship row.
+
+Meaning:
+- Identifies that the current row's **target side** is an intermediate landing target such as a session table, CTE, variable, cursor, or parameter-like routine slot.
+- This column does **not** mean a full intermediate traversal path.
+- This column does **not** mean the complete set of intermediate steps between a source and a final persistent target.
+- This column does **not** replace mapping semantics in `relationship`.
+- This column does **not** connect separate direct rows together.
+
+Population rules:
+- Populate this column only when the current row's `target_object_type` is an intermediate entity such as `SESSION_TABLE`, `CTE`, `VARIABLE`, `CURSOR`, or `PROCEDURE` / `FUNCTION` when representing parameter assignments.
+- Treat this column primarily as a **target-landing tag** for intermediate structures.
+- **Preferred population cases:**
+  - mapping rows (`*_MAP`)
+  - target-column declaration rows when the declared target is intermediate
+  - structural rows such as `CTE_DEFINE`, `CTE_READ`, `CURSOR_DEFINE`, `CURSOR_READ`
+  - object write / create rows whose target is intermediate, such as `CREATE_TABLE` for session tables
+- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than intermediate landing. This includes:
+  - `SELECT_FIELD`
+  - `SELECT_EXPR`
+  - `WHERE`
+  - `JOIN_ON`
+  - `GROUP_BY`
+  - `HAVING`
+  - `ORDER_BY`
+  - `MERGE_MATCH`
+  - `UPDATE_SET`
+  - `CONTROL_FLOW_CONDITION`
+- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
+
+Format:
+- `target_object.target_field` when `target_field` is present
+- otherwise `target_object`
+
+### `confidence`
+Extraction confidence.
+
+Allowed values:
+- `PARSER`
+- `REGEX`
+- `DYNAMIC_LOW_CONFIDENCE`
+
+## Stable output ordering
+
+For stable TSV generation, rows should be ordered primarily by:
+1. source-object traversal order
+2. source line order
+3. `line_relation_seq`
+
+When multiple rows come from the same (`source_object_type`, `source_object`, `line_no`) group, use the natural SQL ordering described above.
+
+## `SELECT *` expansion rule
+
+When SQL uses `SELECT *`, the extractor may expand `*` into concrete columns **only if**:
+- source schema metadata is available,
+- source column order is stable and known,
+- and the downstream mapping target can be aligned truthfully.
+
+If those conditions are not met:
+- emit only object-level read rows,
+- or emit lower-confidence fallback rows,
+- but do **not** fabricate field-level rows.
+
+## Callable parameter naming rule
+
+For both procedures and functions:
+- use the **formal parameter name** in `target_field` when callable signature metadata is available;
+- otherwise use positional slots `$1`, `$2`, ...;
+- do not mix named and positional styles for the same callable when the formal signature is known.
+
+## Relationship filling matrix
+
+### 1. Object-definition relationships
+
+#### `CREATE_VIEW`
+Meaning: defines a view object.
+- `source_field` = empty
+- `target_object_type` = `VIEW`
+- `target_object` = created view
+- `target_field` = empty
+
+#### `CREATE_TABLE`
+Meaning: defines a table-like object, including DB2 session / DGTT-style table objects when applicable.
+- `source_field` = empty
+- `target_object_type` = resolved created object type
+- `target_object` = created object
+- `target_field` = empty
+
+#### `CREATE_PROCEDURE`
+Meaning: defines a stored procedure object.
+- `source_field` = empty
+- `target_object_type` = `PROCEDURE`
+- `target_object` = created procedure
+- `target_field` = empty
+
+#### `CREATE_FUNCTION`
+Meaning: defines a user-defined function object.
+- `source_field` = empty
+- `target_object_type` = `FUNCTION`
+- `target_object` = created function
+- `target_field` = empty
+
+### 2. Object-usage relationships
+
+#### `SELECT_TABLE`
+Meaning: statement directly reads a table.
+- `source_field` = empty
+- `target_object_type` = `TABLE` or `SESSION_TABLE`
+- `target_object` = read object
+- `target_field` = empty
+
+#### `SELECT_VIEW`
+Meaning: statement directly reads a view.
+- `source_field` = empty
+- `target_object_type` = `VIEW`
+- `target_object` = read view
+- `target_field` = empty
+
+#### `INSERT_TABLE`
+Meaning: statement inserts into an object.
+- `source_field` = empty
+- `target_object_type` = insert target type
+- `target_object` = insert target
+- `target_field` = empty
+
+#### `UPDATE_TABLE`
+Meaning: statement updates an object.
+- `source_field` = empty
+- `target_object_type` = updated object type
+- `target_object` = updated object
+- `target_field` = empty
+
+#### `MERGE_INTO`
+Meaning: statement merges into an object.
+- `source_field` = empty
+- `target_object_type` = merge target type
+- `target_object` = merge target
+- `target_field` = empty
+
+#### `DELETE_TABLE`
+Meaning: statement deletes from a table.
+- `source_field` = empty
+- `target_object_type` = `TABLE`
+- `target_object` = deleted-from table
+- `target_field` = empty
+
+#### `DELETE_VIEW`
+Meaning: statement deletes from a view.
+- `source_field` = empty
+- `target_object_type` = `VIEW`
+- `target_object` = deleted-from view
+- `target_field` = empty
+
+#### `TRUNCATE_TABLE`
+Meaning: statement truncates a table.
+- `source_field` = empty
+- `target_object_type` = `TABLE`
+- `target_object` = truncated table
+- `target_field` = empty
+
+#### `CALL_FUNCTION`
+Meaning: statement directly invokes a function.
+- `source_field` = empty
+- `target_object_type` = `FUNCTION`
+- `target_object` = called function
+- `target_field` = empty
+
+#### `CALL_PROCEDURE`
+Meaning: statement directly invokes a procedure.
+- `source_field` = empty
+- `target_object_type` = `PROCEDURE`
+- `target_object` = called procedure
+- `target_field` = empty
+
+### 3. Target-column declaration relationships
+
+#### `INSERT_TARGET_COL`
+Meaning: an `INSERT (...)` target column slot is explicitly declared.
+- `source_field` = empty
+- `target_object_type` = insert target type
+- `target_object` = insert target
+- `target_field` = declared target column
+- Emit this relationship only when the SQL text contains an explicit `INSERT (col1, col2, ...)` target-column list.
+
+#### `UPDATE_TARGET_COL`
+Meaning: a target column is assigned in an `UPDATE SET` clause.
+- `source_field` = empty
+- `target_object_type` = updated object type
+- `target_object` = updated object
+- `target_field` = target column being assigned
+
+#### `MERGE_TARGET_COL`
+Meaning: a target column is assigned in either branch of a `MERGE`.
+- `source_field` = empty
+- `target_object_type` = merge target type
+- `target_object` = merge target
+- `target_field` = target column being updated or inserted
+
+### 4. Direct field-usage relationships
+
+#### `SELECT_FIELD`
+Meaning: a resolved field is directly projected in a `SELECT` list as a plain field projection, without additional expression wrapping.
+- `source_field` = projected field name
+- `target_object_type` = owning object type of that field
+- `target_object` = owning object
+- `target_field` = same resolved field
+
+#### `SELECT_EXPR`
+Meaning: a direct token participates in a `SELECT` expression or non-column select-list item.
+Use this for:
+- fields inside expressions
+- literals projected in the select list
+- special registers projected in the select list
+- computed expressions whose direct operands can be identified
+- `source_field` = participating token (field name or `CONSTANT:<VALUE>`)
+- `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
+- `target_object` = owning object when applicable, otherwise a stable placeholder such as `UNKNOWN_SELECT_EXPR`
+- `target_field` = participating field when applicable, otherwise empty
+
+#### `UPDATE_SET`
+Meaning: a direct RHS token is used in an `UPDATE SET` assignment expression.
+- `source_field` = RHS participating token (field name or `CONSTANT:<VALUE>`)
+- `target_object_type` = updated target object type
+- `target_object` = updated target object
+- `target_field` = target column being assigned
+
+### 5. Field-mapping relationships (propagation-capable)
+
+**Precedence note:** More specific mappings take precedence over generic assignment mappings. Emit only the most specific relationship for the same direct semantic role.
+
+Specific relationships include:
+- `SPECIAL_REGISTER_MAP`
+- `DIAGNOSTICS_FETCH_MAP`
+- `FUNCTION_PARAM_MAP`
+- `CALL_PARAM_MAP`
+- `FUNCTION_EXPR_MAP`
+
+#### `CREATE_VIEW_MAP`
+Meaning: source column or direct literal maps into a created view column.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = `VIEW`
+- `target_object` = target view
+- `target_field` = target view column
+
+#### `INSERT_SELECT_MAP`
+Meaning: source column or direct literal maps into an insert target column.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = insert target type
+- `target_object` = insert target
+- `target_field` = insert target column
+
+#### `UPDATE_SET_MAP`
+Meaning: source column or direct literal maps into an updated target column.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = updated target type
+- `target_object` = updated target
+- `target_field` = updated target column
+
+#### `MERGE_SET_MAP`
+Meaning: source column or direct literal maps into a `MERGE` matched-update target column.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = merge target type
+- `target_object` = merge target
+- `target_field` = target column
+
+#### `MERGE_INSERT_MAP`
+Meaning: source column or direct literal maps into a `MERGE` insert-branch target column.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = merge target type
+- `target_object` = merge target
+- `target_field` = target column
+
+#### `VARIABLE_SET_MAP`
+Meaning: a source column, parameter, variable, literal, or direct expression operand is assigned into a declared variable.
+- `source_field` = direct source token or `CONSTANT:<VALUE>`
+- `target_object_type` = `VARIABLE`
+- `target_object` = owning routine
+- `target_field` = receiving variable name
+
+#### `CURSOR_FETCH_MAP`
+Meaning: a source column from a cursor is mapped into a local variable or record slot during `FETCH` or implicit cursor iteration.
+- `source_field` = cursor column name
+- `target_object_type` = `VARIABLE`
+- `target_object` = owning routine
+- `target_field` = receiving variable or record slot
+- Prefer qualified slot targets such as `V_REC.DEAL_NUM` when the target record structure is known.
+- If only the whole record variable is known, the record variable name may be used as a fallback.
+
+#### `FUNCTION_PARAM_MAP`
+Meaning: maps an actual argument into a called function's formal parameter.
+- `source_field` = actual argument token (field, variable, or `CONSTANT:<VALUE>`)
+- `target_object_type` = `FUNCTION`
+- `target_object` = called function
+- `target_field` = formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
+- Emit for scalar functions and table functions.
+
+#### `CALL_PARAM_MAP`
+Meaning: maps an actual argument into a called procedure parameter, or maps a procedure `OUT` / `INOUT` result into a receiving local variable.
+- `source_field` = actual argument token, or the procedure `OUT` / `INOUT` parameter token when receiving a returned value
+- `target_object_type` =
+  - `PROCEDURE` when passing into the callable
+  - `VARIABLE` when receiving an `OUT` / `INOUT` value locally
+- `target_object` =
+  - called procedure name when passing into the callable
+  - owning local routine when receiving the returned value
+- `target_field` =
+  - formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
+  - or receiving local variable name for `OUT` / `INOUT` result capture
+
+#### `TABLE_FUNCTION_RETURN_MAP`
+Meaning: a source column or direct literal maps into a table-valued function `RETURN` table definition.
+- `source_field` = source column or `CONSTANT:<VALUE>`
+- `target_object_type` = `FUNCTION`
+- `target_object` = owning function
+- `target_field` = target return column
+
+#### `SPECIAL_REGISTER_MAP`
+Meaning: a DB2 special register is directly mapped into a target column or variable.
+- `source_field` = `CONSTANT:<SPECIAL_REGISTER>`
+- `target_object_type` = target object type (`TABLE`, `VIEW`, or `VARIABLE`)
+- `target_object` = target object
+- `target_field` = target column or variable
+
+#### `DIAGNOSTICS_FETCH_MAP`
+Meaning: diagnostic information such as `SQLCODE`, `SQLSTATE`, or `GET DIAGNOSTICS` properties is fetched into a local variable.
+- `source_field` = diagnostic token such as `CONSTANT:SQLSTATE`
+- `target_object_type` = `VARIABLE`
+- `target_object` = owning routine
+- `target_field` = receiving variable
+
+#### `FUNCTION_EXPR_MAP`
+Meaning: a function return value is used directly inside a field-level mapping expression.
+- `source_field` = called function name
+- `target_object_type` = target object type being modified
+- `target_object` = target object
+- `target_field` = target column or variable
+
+### 6. Predicate / condition relationships
+
+#### `WHERE`
+Meaning: a direct token participates in a `WHERE` predicate.
+- `source_field` = participating token (field or `CONSTANT:<VALUE>`)
+- `target_object_type` = owning object type, or `CURSOR` for `WHERE CURRENT OF cursor_name`
+- `target_object` = owning object or cursor name
+- `target_field` = participating field when applicable, otherwise empty
+
+#### `JOIN_ON`
+Meaning: a direct token participates in a join condition.
+Same fill rule as `WHERE`.
+
+#### `MERGE_MATCH`
+Meaning: a direct token participates in the `MERGE ... ON ...` match condition.
+Same fill rule as `WHERE`.
+
+#### `GROUP_BY`
+Meaning: a direct field participates in grouping.
+Same fill rule as `WHERE`.
+
+#### `ORDER_BY`
+Meaning: a direct token participates in ordering.
+Same fill rule as `WHERE`.
+
+#### `HAVING`
+Meaning: a direct token participates in a `HAVING` predicate.
+
+Two valid forms are allowed:
+1. **Field-level / token-level** when a direct field or literal token can be resolved.
+   - `source_field` = participating token
+   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
+   - `target_object` = owning object when applicable, otherwise `UNKNOWN_AGGREGATE`
+   - `target_field` = participating field when applicable, otherwise empty
+2. **Object-level fallback** when the expression has no stable direct token representation.
+   - `source_field` = empty
+   - `target_object_type` = owning object type or `UNKNOWN`
+   - `target_object` = owning object or `UNKNOWN_AGGREGATE`
+   - `target_field` = empty
+
+#### `CONTROL_FLOW_CONDITION`
+Meaning: a direct token participates in a procedural control-flow evaluation such as `IF`, `WHILE`, `CASE`, or `REPEAT`.
+- `source_field` = participating token (variable, field, or `CONSTANT:<VALUE>`)
+- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
+- `target_object` = owning routine
+- `target_field` = participating variable or field when applicable, otherwise empty
+
+### 7. Intermediate / structural relationships
+
+#### `CTE_DEFINE`
+Meaning: defines a CTE object.
+- `source_field` = empty
+- `target_object_type` = `CTE`
+- `target_object` = CTE name
+- `target_field` = empty
+
+#### `CTE_READ`
+Meaning: statement reads a CTE object.
+- `source_field` = empty
+- `target_object_type` = `CTE`
+- `target_object` = CTE name
+- `target_field` = empty
+
+#### `UNION_INPUT`
+Meaning: the current select branch contributes one direct object input to a `UNION` / `UNION ALL` chain.
+- `source_field` = empty
+- `target_object_type` = concrete input object type
+- `target_object` = concrete input object
+- `target_field` = empty
+
+#### `CURSOR_DEFINE`
+Meaning: defines a named cursor and its associated `SELECT`.
+- `source_field` = empty
+- `target_object_type` = `CURSOR`
+- `target_object` = cursor name
+- `target_field` = empty
+
+#### `CURSOR_READ`
+Meaning: statement explicitly opens, fetches from, closes, or otherwise reads from a cursor.
+- `source_field` = empty
+- `target_object_type` = `CURSOR`
+- `target_object` = cursor name
+- `target_field` = empty
+
+#### `EXCEPTION_HANDLER_MAP`
+Meaning: an exception handler explicitly captures or redirects control flow/state based on an error condition.
+- `source_field` = caught condition token such as `CONSTANT:SQLEXCEPTION`, `CONSTANT:NOT FOUND`, `CONSTANT:'02000'`
+- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
+- `target_object` = owning routine
+- `target_field` = empty
+
+### 8. Return / execution relationships
+
+#### `RETURN_VALUE`
+Meaning: direct operand-level dependency of a **scalar** function `RETURN` expression.
+For table-valued functions, use `TABLE_FUNCTION_RETURN_MAP` instead.
+
+Valid forms:
+1. **Operand-level token dependency**
+   - `source_field` = direct operand token (field, variable, or `CONSTANT:<VALUE>`)
+   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
+   - `target_object` = owning object when applicable, otherwise `UNKNOWN_RETURN_EXPR`
+   - `target_field` = participating field / variable when applicable, otherwise empty
+2. **Callable dependency**
+   - `source_field` = empty
+   - `target_object_type` = `FUNCTION`
+   - `target_object` = called function
+   - `target_field` = empty
+
+Examples:
+- `RETURN P_FACTOR * 2;` may emit:
+  - operand row for `P_FACTOR`
+  - operand row for `CONSTANT:2`
+- `RETURN MY_FUNC(V_X);` may emit:
+  - callable dependency row to `MY_FUNC`
+  - plus `FUNCTION_PARAM_MAP` rows for `V_X -> MY_FUNC.<param>`
+
+#### `DYNAMIC_SQL_EXEC`
+Meaning: a variable or literal containing dynamic SQL is executed, such as `EXECUTE IMMEDIATE`.
+- `source_field` = participating variable or string literal
+- `target_object_type` = `UNKNOWN`
+- `target_object` = `UNKNOWN_DYNAMIC_SQL`
+- `target_field` = empty
+
+### 9. Unknown / unresolved relationships
+
+#### `UNKNOWN`
+Meaning: a direct statement exists but cannot yet be expressed as a stronger supported relationship.
+- `source_field` = empty unless a direct unresolved token is important for review
+- `target_object_type` = `UNKNOWN`
+- `target_object` = one of:
+  - `UNKNOWN_UNSUPPORTED_STATEMENT`
+  - `UNKNOWN_UNRESOLVED_OBJECT`
+  - another stable, truthful placeholder of the same class
+- `target_field` = empty
+
+## Optional validation guidance
+
+A validator should flag at least these defect classes:
+- invalid header
+- invalid relationship value
+- invalid confidence value
+- duplicate rows
+- inconsistent `line_relation_seq` within a line group
+- `line_no` not matching the real SQL file
+- `line_content` not matching the real SQL file
+- rows that violate explicit contract rules such as:
+  - `INSERT_TARGET_COL` emitted without an explicit target-column list
+  - `SELECT_FIELD` emitted for a literal projection
+  - mixed named and positional parameter targets for the same callable when the signature is known
