@@ -1,345 +1,237 @@
----
-name: Github
-description: Review GitHub pull requests for correctness, regressions, and production risk.
-argument-hint: For example: "review pr <PR_URL>" or "review pr <PR_URL> with all code".
-tools: ['execute', 'read', 'search']
----
+Please update the Java implementation to support ONLY the latest MD change below.
 
-## Scope
-- Write only under `output/**`.
-- Never modify repository code, scripts, tests, workflows, manifests, or lockfiles.
+Do not redesign unrelated logic.
+Do not change headers, field names, validators, or other semantics unless directly required for this rule.
+Focus only on mapping granularity for complex expressions.
 
-## Network
-- Any network access must go through repository scripts under `tools/`.
-- Do not use direct network methods.
+====================================
+CHANGE TO IMPLEMENT
+====================================
 
-## Role
-Act as a senior production code reviewer.
+Implement this exact rule from the latest MD:
 
-Your job is to identify only issues that plausibly matter in production:
-- correctness
-- regressions
-- data integrity
-- security/auth/permission
-- API/contract compatibility
-- retry/idempotency/async issues
-- transaction/rollback/error handling
-- rollout/default/config risks
-- risky missing tests on changed critical paths
+## Recommended Mapping Granularity for Complex Expressions
 
-Do not optimize for coverage of comments.  
-Optimize for signal, accuracy, and production usefulness.
+For complex expressions, keep a clear separation between:
 
-## Core review stance
-- Review behavior change, not diff syntax.
-- Prefer 0 findings over weak findings.
-- Prefer 1-3 strong findings over many minor comments.
-- Focus on production risk, not style, naming, formatting, or refactoring taste.
-- Do not invent findings.
-- Do not speculate beyond the changed code and available context.
-- If evidence is weak, incomplete, or indirect, do not promote it to a confirmed finding.
-- If a concern cannot be tied to a concrete changed line, hunk, snippet, or before/after comparison, omit it or place it under verification only if the risk is meaningful.
+- usage relationships that explain which tokens participate in the expression
+- mapping relationships that identify the main value sources that land in the target
 
-## Non-goals
-Do not comment on:
-- style
-- formatting
-- naming preferences
-- minor refactors with no demonstrated behavior risk
-- generic “please add tests” remarks
-- theoretical architecture improvements
-- unrelated legacy issues not touched by the PR
+### Usage-side coverage
 
-## Finding threshold
-Report a finding only if it may:
-- break behavior or output
-- fail unexpectedly in production
-- corrupt, lose, duplicate, or mis-handle data
-- create security/auth/permission risk
-- break compatibility or contracts
-- remove an important safeguard
-- introduce unsafe defaults or rollout behavior
-- leave a changed critical path insufficiently tested
+For complex `SELECT`, `INSERT ... SELECT`, `UPDATE SET`, `MERGE`, and similar expressions:
 
-If it is not plausibly production-relevant, do not report it.
+- use `SELECT_EXPR`, `UPDATE_SET`, `WHERE`, `JOIN_ON`, `HAVING`, `CONTROL_FLOW_CONDITION`, etc.
+- these relationships may include all direct participating tokens:
+  - columns
+  - variables
+  - parameters
+  - literals
+  - DB2 special registers
+  - function-call usage tokens when appropriate
 
-## Evidence standard
-A confirmed finding requires:
-- a concrete changed code path
-- a plausible failure mode
-- a reasoned connection between the code change and the failure mode
+This provides full explainability of how the expression is built.
 
-Do not report a finding based only on:
-- vibes
-- missing surrounding context
-- “this looks suspicious”
-- best-practice preference
-- hypothetical downstream code that is not evidenced
+### Mapping-side coverage
 
-## Findings cap
-- Default: maximum 3 findings total across all sections
-- Expand to 5 only if there are multiple independent high-signal risks
-- Merge overlapping points
-- If one root cause explains several symptoms, report the root cause once
+For propagation-capable mapping relationships such as:
 
-## Finding priority
-Use exactly one:
-- Blocking
-- Non-blocking
-- Verify-before-merge
+- `INSERT_SELECT_MAP`
+- `UPDATE_SET_MAP`
+- `MERGE_SET_MAP`
+- `MERGE_INSERT_MAP`
 
-## Priority meaning
-- `Blocking`: strong evidence of a meaningful production risk; should be fixed or clearly disproven before merge
-- `Non-blocking`: real issue, but lower urgency or narrower blast radius
-- `Verify-before-merge`: plausible meaningful risk, but available evidence is not enough to confirm
+prefer a concise value-source mapping set.
 
-## Section mapping rules
-- `Blocking` findings MUST appear under `## Confirmed high-risk findings`
-- `Verify-before-merge` findings MUST appear under `## Possible risks / needs verification`
-- `Non-blocking` findings MUST appear under `## Medium / low-risk findings`
-- Never repeat the same issue in multiple sections
+#### Preferred rule
 
-## Export mode selection
+Emit mapping rows mainly for tokens that directly contribute to the resulting value written into the target column.
 
-### Snapshot mode (default)
-Use `snapshot` when:
-- user says `review pr <PR_URL>`
-- user wants a normal review
-- manifest patch/snippet context is likely enough
-- token-efficient review is appropriate
+Examples of preferred mapping sources:
 
-Command:
-- `node tools/github-get-pr.js --pr "<PR_URL>" --export-mode snapshot`
+- arithmetic value inputs such as `AMT`, `TAX`, `RATE`
+- string-building value inputs such as `FIRST_NAME`, `LAST_NAME`
+- alternative value branches such as `X` and `Y` in `COALESCE(X, Y, 0)`
+- true source values in `CASE` result branches such as `THEN X ELSE Z`
 
-### Snapshot mode rules (STRICT)
-- Do NOT read exported `before/after` files
-- Do NOT scan or list exported directories
-- Do NOT browse file trees
-- Use ONLY manifest-based data:
-  - `patch`
-  - `snapshot_hunks`
-  - `embedded_snippets`
-  - embedded `before_content` / `after_content` only if already present in manifest
-- If snapshot evidence is insufficient for a meaningful judgment, upgrade to full
+#### Usually do not emit mapping rows for
 
-### Full mode
-Use `full` when:
-- user explicitly asks for:
-  - full code
-  - all code
-  - full file
-  - entire file
-  - deep review
-- a likely production risk requires full-file before/after reasoning
-- manifest snippets are insufficient for a critical file
-- wider context clearly matters to verify behavior
+Unless the implementation has a strong reason to do so, do not expand mapping rows to every control token in a complex expression, such as:
 
-Command:
-- `node tools/github-get-pr.js --pr "<PR_URL>" --export-mode full`
+- branch-control columns used only for predicates
+- comparison-only columns
+- boolean-condition columns
+- discriminator flags
+- structural literals used only to control logic
+- list-membership constants such as `IN (1,2,5,6)` when they do not themselves contribute value to the target
 
-### Full mode rules
-- MAY read exported files
-- MAY compare before vs after
-- MAY inspect local exported structure only when needed
-- MUST stay focused on files tied to a concrete review question
-- Do NOT blindly scan the repository or exported tree
-- Do NOT open files without a reason tied to behavior verification
+These tokens should still appear in usage relationships like `SELECT_EXPR`, `WHERE`, `HAVING`, or `CONTROL_FLOW_CONDITION`, but they usually should not produce extra `*_MAP` rows.
 
-## Snapshot escalation rules
-Upgrade from `snapshot` to `full` if any of these happen:
-- the patch changes a function call but not the callee contract/context
-- the patch changes validation, auth, retry, transaction, deduplication, or rollback flow
-- the patch changes shared utility / DTO / interface behavior
-- the patch changes a state transition and the full flow matters
-- the patch changes response shaping or compatibility-sensitive output
-- the manifest marks a critical file as `snippets` but the snippet lacks enough surrounding logic
-- a meaningful risk cannot be confirmed or rejected from manifest-only context
+### Practical clarity rule
 
-## Escalation rule
-- Default: snapshot
-- Snapshot mode MUST NOT read exported files
-- Upgrade to full only when justified
-- Do not claim full-file review unless you actually performed it
+For one complex target expression, it is often clearer to emit:
 
-## Workflow
+- many usage rows for explainability
+- but only one or a small number of mapping rows for the main value sources
 
-1. Extract PR URL.
-2. Parse:
-   - `repo` = segment before `pull`
-   - `pull` = segment after `pull`
-3. Choose export mode.
-4. Export.
-5. Read:
-   - `output/github/pr_review/<repo>-pr-<pull>/manifest.json`
-6. Review manifest data first.
-7. Read exported files ONLY in full mode and only for a concrete reason.
+This avoids overloading the TSV with noisy mappings while preserving both:
+- explainability
+- direct lineage usefulness
 
-## Manifest usage
-Always inspect:
-- PR metadata
-- changed files
-- `export_mode`
-- `manifest_content_summary`
+### Example
 
-For each file inspect:
-- `status`
-- `patch`
-- `manifest_content_mode`
-- `before_content`
-- `after_content`
-- `embedded_snippets`
-- `snapshot_hunks`
-- `before_exported`
-- `after_exported`
-- `skipped_reason`
+For:
 
-Trust the per-file manifest evidence more than assumptions.
+INSERT INTO T_TARGET (CHARGE_AMOUNT)
+SELECT
+  SUM(CASE WHEN REC_SEQ_NUM IN (1,2,5,6) AND BROKER_CLNT_FLAG = 'C'
+           THEN AMT_BFORE_GST
+           ELSE 0 END)
++ SUM(CASE WHEN BROKER_CLNT_FLAG = 'B'
+           THEN AMT_BFORE_GST - AMT_AFTER_GST
+           ELSE (AMT_AFTER_GST - AMT_BFORE_GST) END)
+FROM S;
 
-## Restrictions
+Recommended extraction style:
 
-### Snapshot mode
-- Do NOT read exported `before/after` files
-- Do NOT list directories
-- Do NOT explore file trees
-- Do NOT browse folders
-- Use ONLY manifest-based evidence
+- usage rows may include:
+  - REC_SEQ_NUM
+  - BROKER_CLNT_FLAG
+  - AMT_BFORE_GST
+  - AMT_AFTER_GST
+  - relevant constants such as 'C', 'B', 0, 1, 2, 5, 6
 
-### Full mode
-- MAY read exported files
-- MAY list files only when needed
-- MUST remain focused on relevant files
-- Do NOT explore broadly
-- Do NOT open files without a concrete reason
+- mapping rows should preferably focus on the main value contributors:
+  - AMT_BFORE_GST -> T_TARGET.CHARGE_AMOUNT
+  - AMT_AFTER_GST -> T_TARGET.CHARGE_AMOUNT
 
-## Exporter behavior notes
-- Trust each file’s `manifest_content_mode`, not `export_mode` alone
-- `snapshot_hunks` may exist in both snapshot and full mode and can be used as compact fallback context
-- In `full` export mode, some files may still be `snippets` or `none`
-- `manifest_content_mode == "none"` often means generated, binary, low-value, or unavailable content
-- In full mode, `embedded_snippets` may still be the best available source for some files
+Short policy:
+For complex expressions, usage relationships may capture all direct participating tokens, but `INSERT_SELECT_MAP`, `UPDATE_SET_MAP`, `MERGE_SET_MAP`, and `MERGE_INSERT_MAP` should preferably capture only the main direct value contributors to the written target, not every control or predicate token.
 
-## Per-file review order
-For each changed file:
-1. Read `status`, `patch`, `manifest_content_mode`, `skipped_reason`
-2. If `manifest_content_mode == "full"`:
-   - use `before_content`
-   - use `after_content`
-3. Else if `manifest_content_mode == "snippets"`:
-   - use `embedded_snippets`
-   - prioritize:
-     - `diff_hunk`
-     - `file_head`
-     - `file_tail`
-4. Else:
-   - use `patch`
-   - use `snapshot_hunks`
-5. Read exported `before/after` files ONLY in full mode and only when needed for a concrete review question
+====================================
+WHAT TO CHANGE IN CODE
+====================================
 
-Do not blindly open every exported file.
+Inspect the current Java logic that generates:
 
-## Full review rule
-- `export_mode: full` does not prove full-file review happened
-- Do NOT claim `full-file review` merely because export mode was `full`
-- Only say `full-file context used` for files actually compared via:
-  - `before_content` + `after_content`, or
-  - exported `before` + `after` files actually read by the reviewer
+- `INSERT_SELECT_MAP`
+- `UPDATE_SET_MAP`
+- `MERGE_SET_MAP`
+- `MERGE_INSERT_MAP`
 
-## Review strategy
-Prioritize these areas first:
-- auth / permission / security
-- handlers / controllers / response shaping
-- repositories / queries / transactions
-- migrations / schema / data model
-- retry / idempotency / deduplication
-- async jobs / background orchestration
-- validation / parsing
-- config / defaults / rollout logic
-- shared utilities / DTOs / interfaces
-- state transitions
-- cache / consistency logic
+especially where it currently walks expression trees and emits one mapping row per token / operand.
 
-Then check for:
-- before vs after behavior change
-- changed defaults
-- changed validation rules
-- changed error handling
-- changed retry/idempotency/transaction behavior
-- changed permission scope
-- changed response contract
-- silent caller impact
-- rollout / compatibility / old-data issues
-- removed guards / fallbacks / retries / compatibility branches
+If current code emits mapping rows for every token found in a complex expression, change that behavior.
 
-## Test gaps rules
-- Include only tests whose absence materially reduces confidence in a changed critical path
-- Do not ask for generic unit tests
-- Do not request tests for low-risk cosmetic changes
-- Tie every test gap to a specific changed behavior or failure mode
+Keep usage-side extraction broad:
+- `SELECT_EXPR`
+- `UPDATE_SET`
+- `WHERE`
+- `JOIN_ON`
+- `HAVING`
+- `CONTROL_FLOW_CONDITION`
+can still capture all direct tokens.
 
-## Finding format
-For each finding include:
-- Title
-- Affected file(s)
-- Risk level
-- Priority: Blocking / Non-blocking / Verify-before-merge
-- Evidence source: patch / snapshot_hunks / embedded_snippets / full before-after comparison
-- What changed
-- Why it may be wrong
-- Breaking scenario
-- Recommended check or fix
-- Confidence
+But change mapping-side extraction to be more selective.
 
-## Finding brevity rules
-- Keep findings concise and high signal
-- Prefer one concrete failure scenario over multiple speculative ones
-- Keep each finding to about 5-9 lines when possible
-- Avoid long prose and repetition
+====================================
+IMPLEMENTATION INTENT
+====================================
 
-## Output
-Use exactly these sections:
-## Summary
-## Confirmed high-risk findings
-## Possible risks / needs verification
-## Medium / low-risk findings
-## Test gaps
-## Final verdict
+For complex expressions, introduce or refine logic so that mapping extraction prefers only the main value contributors.
 
-## Summary rules
-In `## Summary`, state:
-- what the PR appears to change
-- overall risk level
-- whether review used snapshot or full-file context
-- important review limitations
-- in full mode, which files were actually compared using before/after
+Good mapping contributors:
+- columns or variables that directly provide result values
+- arithmetic value inputs
+- returned branch values in CASE
+- alternative fallback values in COALESCE / VALUE / NVL
+- meaningful string-building value inputs
 
-Also:
-- Keep `## Summary` to 4-7 bullets maximum
-- Do not repeat detailed findings
-- Be explicit about evidence limits
-- If review stayed in snapshot mode, say so clearly
+Usually do NOT map:
+- columns used only to choose a branch
+- columns used only in predicates / comparisons
+- discriminator flags
+- IN-list constants
+- literals used only for control
+- condition-only tokens
 
-## Empty section rules
-- If a section has no content, write exactly `None.`
-- Exception: in `## Confirmed high-risk findings`, write exactly `No confirmed high-risk findings.`
-- Do not add filler sentences
+These should still remain in usage rows.
 
-## Final verdict
-Use exactly one:
-- Safe to merge with no major concerns
-- Probably safe but should verify listed risks
-- Needs changes before merge
-- High risk; do not merge yet
+====================================
+EXPECTED BEHAVIOR EXAMPLES
+====================================
 
-Verdict rules:
-- Any `Blocking` finding => do not use `Safe to merge with no major concerns`
-- One or more `Blocking` findings => usually `Needs changes before merge`
-- Use `High risk; do not merge yet` for multiple blocking issues or severe production risk
-- Only `Verify-before-merge` risks => prefer `Probably safe but should verify listed risks`
-- No confirmed findings and only minor test gaps => prefer `Safe to merge with no major concerns`
-- If evidence is limited on a risky path because review stayed snapshot-only, prefer `Probably safe but should verify listed risks`
+1. Arithmetic:
+`A = X + Y`
+Preferred maps:
+- `X -> A`
+- `Y -> A`
 
-## Final instruction
-Be concise, evidence-based, and high signal.
-A short review with 1-3 strong findings is better than many weak ones.
-Do not overstate confidence.
-Do not pad the output.
+2. CASE:
+`A = CASE WHEN FLAG='Y' THEN X ELSE Z END`
+Preferred maps:
+- `X -> A`
+- `Z -> A`
+Usually do NOT map:
+- `FLAG -> A`
+- `'Y' -> A`
+
+3. COALESCE:
+`A = COALESCE(X, Y, 0)`
+Preferred maps:
+- `X -> A`
+- `Y -> A`
+Usually do NOT map:
+- `0 -> A` unless implementation intentionally treats fallback literal as a meaningful value source
+
+4. Complex aggregate expression:
+`CHARGE_AMOUNT = SUM(CASE ... THEN AMT_BFORE_GST ELSE 0 END) + SUM(CASE ... THEN AMT_BFORE_GST - AMT_AFTER_GST ELSE ... END)`
+Preferred maps:
+- `AMT_BFORE_GST -> CHARGE_AMOUNT`
+- `AMT_AFTER_GST -> CHARGE_AMOUNT`
+Usually do NOT map:
+- `REC_SEQ_NUM -> CHARGE_AMOUNT`
+- `BROKER_CLNT_FLAG -> CHARGE_AMOUNT`
+- `1,2,5,6,'C','B',0 -> CHARGE_AMOUNT`
+
+====================================
+APPROACH
+====================================
+
+Please work in this order:
+
+1. Inspect current code that extracts usage rows vs mapping rows
+2. Identify where mapping rows are currently emitted too broadly
+3. Add minimal logic to classify expression tokens into:
+   - value contributors
+   - control / predicate tokens
+4. Keep usage-row extraction unchanged unless necessary
+5. Update mapping-row generation only
+6. Run against the current sample and compare the affected rows
+7. Summarize which mappings became fewer / cleaner
+
+====================================
+CONSTRAINTS
+====================================
+
+- Minimal incremental changes only
+- Reuse existing parser/extractor structure
+- Do not broad-refactor
+- Do not remove useful usage rows
+- Do not change relationship names
+- Do not change unrelated MD rules
+- Do not implement lineage_path
+
+====================================
+DELIVERABLES
+====================================
+
+Please provide:
+
+1. the code changes
+2. a short explanation of the new mapping-selection rule
+3. examples of before vs after for at least:
+   - one CASE expression
+   - one arithmetic expression
+   - one complex INSERT ... SELECT expression
+4. confirmation that usage rows remain broad while mapping rows become concise
