@@ -1,824 +1,1352 @@
-# relationship_detail.tsv — revised semantics and filling matrix (DB2-focused, schema-aware)
-
-This document is the **semantic contract** for generating and validating `relationship_detail.tsv`.
-
-It is intended to stay aligned with the current sample SQL and TSV, but it is **authoritative over the TSV** when the two diverge. Any mismatch between this document and a generated TSV should be treated as a defect in either:
-- the extractor / parser / post-processor, or
-- this contract itself.
-
-## Core principle
-
-Each row records **one direct, single-hop relationship** found in a source SQL object.
-
-The core meaning of a row must be readable from these main columns:
-- `source_object_type`
-- `source_object`
-- `source_field`
-- `target_object_type`
-- `target_object`
-- `target_field`
-- `relationship`
-- `line_no`
-- `line_relation_seq`
-- `line_content`
-
-`persistent_target_objects` and `intermediate_target_objects` are auxiliary **target-side classification** columns for the current direct relationship row. They indicate whether the row's target lands on a persistent target or an intermediate target. They do **not** represent full propagated lineage impact, do **not** represent a full intermediate path, and do **not** change the semantic meaning of the row.
-
-## General extraction rules
-
-### Directness
-Only emit **direct single-hop** relationships.
-Do **not** collapse multi-hop propagation into one row.
-
-Examples:
-- `A -> V1` and `V1 -> T1` are two direct rows, not one inferred `A -> T1` row.
-- `FUNCTION_EXPR_MAP` captures that a function result is used in an assignment expression; it does not replace argument lineage into the function itself.
-
-### Exact source fidelity
-- `line_no` must be the **exact physical source line number** from the SQL file.
-- `line_content` must be the **exact original raw source line** from the SQL file.
-- If a row's semantics are correct but the `line_no` or `line_content` is wrong, the row is still considered defective.
-
-### Schema-aware expansion
-The extractor may use schema/catalog metadata (DDL or live database metadata) to resolve:
-- object types
-- column ownership
-- `SELECT *` expansion
-- named function/procedure parameters
-- target-column alignment for `INSERT ... SELECT` and `MERGE`
-
-If required schema metadata is unavailable:
-- prefer a weaker but truthful row set,
-- or emit lower-confidence fallback rows,
-- but do **not** invent columns or parameter names.
-
-## Literal, special register, and system-value rule
-
-Ensure field-level lineage captures literals and DB2 system-derived values wherever they directly participate in SQL semantics.
-
-### Canonical token form
-Use:
-
-- `CONSTANT:<VALUE>` for literals and DB2 special registers/system constants  
-  Examples:
-  - `CONSTANT:'ACTIVE'`
-  - `CONSTANT:1`
-  - `CONSTANT:NULL`
-  - `CONSTANT:CURRENT TIMESTAMP`
-  - `CONSTANT:CURRENT DATE`
-  - `CONSTANT:USER`
-
-### Where literal/system tokens are allowed
-Literal/system tokens may appear in `source_field` for:
-- `SELECT_EXPR`
-- `INSERT_SELECT_MAP`
-- `UPDATE_SET`
-- `UPDATE_SET_MAP`
-- `MERGE_SET_MAP`
-- `MERGE_INSERT_MAP`
-- `VARIABLE_SET_MAP`
-- `FUNCTION_PARAM_MAP`
-- `CALL_PARAM_MAP`
-- `SPECIAL_REGISTER_MAP`
-- `DIAGNOSTICS_FETCH_MAP`
-- `RETURN_VALUE`
-- `WHERE`
-- `JOIN_ON`
-- `HAVING`
-- `CONTROL_FLOW_CONDITION`
-
-### Relationship choice precedence
-- Use `SPECIAL_REGISTER_MAP` for DB2 special-register assignment/mapping into a target column or variable when that is the most specific meaning.
-- Use `DIAGNOSTICS_FETCH_MAP` for diagnostic-state fetches.
-- Otherwise use the context-appropriate generic relationship (`INSERT_SELECT_MAP`, `UPDATE_SET_MAP`, `SELECT_EXPR`, `RETURN_VALUE`, etc.).
-
-## Column semantics
-
-### `source_object_type`
-Type of the SQL source object that owns the row.
-
-Common values:
-- `VIEW_DDL`
-- `FUNCTION`
-- `PROCEDURE`
-- `SCRIPT`
-
-### `source_object`
-Owning SQL object name.
-
-Examples:
-- `INTERFACE.V_API_MTM_REVAL`
-- `INTERFACE.FN_GET_CODE_MAP_VALUE`
-- `INTERFACE.PI_API_MTM_REVAL_DEMO`
-- `EXTRA_PATTERNS`
-
-### `source_field`
-Primary source-side token for field-level relationships.
-
-Rules:
-- Field-level rows: populate with the direct source or participating token.
-- Object-level rows: leave empty.
-- If the source is a literal or DB2 special register/system value, use `CONSTANT:<VALUE>`.
-- For callable-parameter mappings:
-  - `FUNCTION_PARAM_MAP` / `CALL_PARAM_MAP` use the actual argument token in `source_field`.
-- For `FUNCTION_EXPR_MAP`, use the called function name in `source_field`.
-
-### `target_object_type`
-Resolved object type on the right side of the direct relationship.
-
-Common values:
-- `TABLE`
-- `VIEW`
-- `SESSION_TABLE`
-- `CTE`
-- `FUNCTION`
-- `PROCEDURE`
-- `CURSOR`
-- `VARIABLE`
-- `UNKNOWN`
-
-### `target_object`
-Resolved object on the right side of the direct relationship.
-
-Rules:
-- Use the real resolved object whenever possible.
-- For unresolved placeholders, use a stable placeholder that matches the unresolved class:
-  - `UNKNOWN_DYNAMIC_SQL` for unresolved dynamic SQL text
-  - `UNKNOWN_UNSUPPORTED_STATEMENT` for unsupported but recognized statements such as utilities/admin commands
-  - `UNKNOWN_UNRESOLVED_OBJECT` for syntactically parseable cases whose real object cannot be resolved
-
-### `target_field`
-Resolved field / slot on the right side of the direct relationship.
-
-Rules:
-- Field-level rows: populate with the concrete target / participating field.
-- Object-level rows: leave empty.
-- For assignment-slot relationships (`UPDATE_SET`, `UPDATE_SET_MAP`, etc.), this is the target column or variable receiving the value.
-- For parameter-mapping relationships, use the **formal parameter name** when known; otherwise use a positional slot like `$1`, `$2`, ...
-
-### `relationship`
-One of the allowed relationship types defined below.
-
-### `line_no`
-Exact physical source line number.
-
-### `line_relation_seq`
-Stable per-line sequence number within the same source object.
-
-Rules:
-- Partition by (`source_object_type`, `source_object`, `line_no`)
-- Number from `0`
-- If a source line produces only one relationship row, use `0`
-- This is a **line-level** sequence only. It does **not** number the whole SQL statement across multiple lines.
-- The sequence must follow the **natural SQL relationship order on that line**, not a generic dictionary sort.
-
-Natural SQL ordering rules:
-1. Keep original left-to-right SQL appearance order whenever the line itself provides clear positional order.
-2. For ordered slot relationships, preserve statement slot order:
-   - `INSERT_TARGET_COL`: target-column declaration order inside `INSERT (...)`
-   - `INSERT_SELECT_MAP`, `TABLE_FUNCTION_RETURN_MAP`: select-item / mapping slot order
-   - `UPDATE_TARGET_COL`: `SET` target assignment order
-   - `UPDATE_SET_MAP`: target assignment order, then source-expression appearance order if more than one direct source participates
-   - `MERGE_TARGET_COL`, `MERGE_SET_MAP`, `MERGE_INSERT_MAP`: branch-local target / mapping slot order
-   - `CREATE_VIEW_MAP`: view select-list order
-   - `FUNCTION_PARAM_MAP`, `CALL_PARAM_MAP`: callable argument order
-   - `VARIABLE_SET_MAP`, `SPECIAL_REGISTER_MAP`, `DIAGNOSTICS_FETCH_MAP`, `FUNCTION_EXPR_MAP`: target assignment / slot order
-3. For direct field-usage and predicate rows, preserve token appearance order on the source line:
-   - `SELECT_FIELD`, `SELECT_EXPR`, `WHERE`, `JOIN_ON`, `GROUP_BY`, `HAVING`, `ORDER_BY`, `MERGE_MATCH`, `UPDATE_SET`, `CONTROL_FLOW_CONDITION`, `RETURN_VALUE`
-4. For object-level rows, preserve statement encounter order on that line:
-   - `SELECT_TABLE`, `SELECT_VIEW`, `INSERT_TABLE`, `UPDATE_TABLE`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `MERGE_INTO`, `CALL_FUNCTION`, `CALL_PROCEDURE`, `CTE_DEFINE`, `CTE_READ`, `UNION_INPUT`, `CREATE_VIEW`, `CREATE_TABLE`, `CREATE_PROCEDURE`, `CREATE_FUNCTION`, `UNKNOWN`, `CURSOR_DEFINE`, `CURSOR_READ`, `DYNAMIC_SQL_EXEC`, `EXCEPTION_HANDLER_MAP`
-5. Only use a deterministic fallback sort when the parser cannot recover meaningful natural order. In that fallback case, sort by:
-   `relationship`, `target_object_type`, `target_object`, `target_field`, `source_field`, `line_content`
-
-### `line_content`
-Exact original raw source line from the SQL file.
-
-### `persistent_target_objects`
-Auxiliary **target-side classification** column for the current direct relationship row.
-
-Meaning:
-- Identifies that the current row's **target side** is a persistent landing target.
-- This column does **not** mean full downstream impact.
-- This column does **not** mean the final propagated endpoint of a larger lineage chain.
-- This column does **not** replace mapping semantics in `relationship`.
-- This column does **not** connect separate direct rows together.
-
-Population rules:
-- Populate this column only when the current row's `target_object_type` is a persistent entity such as `TABLE` or `VIEW`, or `UNKNOWN` that truthfully represents a persistent target.
-- Treat this column primarily as a **target-landing tag**. It is most useful when the row itself already expresses a clear landing target.
-- **Preferred population cases:**
-  - mapping rows (`*_MAP`), because the row already means `source -> target`
-  - target-column declaration rows (`*_TARGET_COL`)
-  - object write / create rows such as `INSERT_TABLE`, `UPDATE_TABLE`, `MERGE_INTO`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `CREATE_TABLE`, `CREATE_VIEW`, `CREATE_FUNCTION`, `CREATE_PROCEDURE`
-  - return / output rows when the target side is persistent
-- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than target landing. This includes:
-  - `SELECT_FIELD`
-  - `SELECT_EXPR`
-  - `WHERE`
-  - `JOIN_ON`
-  - `GROUP_BY`
-  - `HAVING`
-  - `ORDER_BY`
-  - `MERGE_MATCH`
-  - `UPDATE_SET`
-  - `CONTROL_FLOW_CONDITION`
-- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
-
-Format:
-- `target_object.target_field` when `target_field` is present
-- otherwise `target_object`
-
-### `intermediate_target_objects`
-Auxiliary **target-side classification** column for the current direct relationship row.
-
-Meaning:
-- Identifies that the current row's **target side** is an intermediate landing target such as a session table, CTE, variable, cursor, or parameter-like routine slot.
-- This column does **not** mean a full intermediate traversal path.
-- This column does **not** mean the complete set of intermediate steps between a source and a final persistent target.
-- This column does **not** replace mapping semantics in `relationship`.
-- This column does **not** connect separate direct rows together.
-
-Population rules:
-- Populate this column only when the current row's `target_object_type` is an intermediate entity such as `SESSION_TABLE`, `CTE`, `VARIABLE`, `CURSOR`, or `PROCEDURE` / `FUNCTION` when representing parameter assignments.
-- Treat this column primarily as a **target-landing tag** for intermediate structures.
-- **Preferred population cases:**
-  - mapping rows (`*_MAP`)
-  - target-column declaration rows when the declared target is intermediate
-  - structural rows such as `CTE_DEFINE`, `CTE_READ`, `CURSOR_DEFINE`, `CURSOR_READ`
-  - object write / create rows whose target is intermediate, such as `CREATE_TABLE` for session tables
-- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than intermediate landing. This includes:
-  - `SELECT_FIELD`
-  - `SELECT_EXPR`
-  - `WHERE`
-  - `JOIN_ON`
-  - `GROUP_BY`
-  - `HAVING`
-  - `ORDER_BY`
-  - `MERGE_MATCH`
-  - `UPDATE_SET`
-  - `CONTROL_FLOW_CONDITION`
-- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
-
-Format:
-- `target_object.target_field` when `target_field` is present
-- otherwise `target_object`
-
-### `confidence`
-Extraction confidence.
-
-Allowed values:
-- `PARSER`
-- `REGEX`
-- `DYNAMIC_LOW_CONFIDENCE`
-
-## Stable output ordering
-
-For stable TSV generation, rows should be ordered primarily by:
-1. source-object traversal order
-2. source line order
-3. `line_relation_seq`
-
-When multiple rows come from the same (`source_object_type`, `source_object`, `line_no`) group, use the natural SQL ordering described above.
-
-## `SELECT *` expansion rule
-
-When SQL uses `SELECT *`, the extractor may expand `*` into concrete columns **only if**:
-- source schema metadata is available,
-- source column order is stable and known,
-- and the downstream mapping target can be aligned truthfully.
-
-If those conditions are not met:
-- emit only object-level read rows,
-- or emit lower-confidence fallback rows,
-- but do **not** fabricate field-level rows.
-
-## Callable parameter naming rule
-
-For both procedures and functions:
-- use the **formal parameter name** in `target_field` when callable signature metadata is available;
-- otherwise use positional slots `$1`, `$2`, ...;
-- do not mix named and positional styles for the same callable when the formal signature is known.
-
-
-
-## Recommended Mapping Granularity for Complex Expressions
-
-For complex expressions, keep a clear separation between:
-
-- **usage relationships** that explain which tokens participate in the expression
-- **mapping relationships** that identify the main value sources that land in the target
-
-### Usage-side coverage
-
-For complex `SELECT`, `INSERT ... SELECT`, `UPDATE SET`, `MERGE`, and similar expressions:
-
-- use `SELECT_EXPR`, `UPDATE_SET`, `WHERE`, `JOIN_ON`, `HAVING`, `CONTROL_FLOW_CONDITION`, etc.
-- these relationships may include all direct participating tokens:
-  - columns
-  - variables
-  - parameters
-  - literals
-  - DB2 special registers
-  - function-call usage tokens when appropriate
-
-This provides full explainability of how the expression is built.
-
-### Mapping-side coverage
-
-For propagation-capable mapping relationships such as:
-
-- `INSERT_SELECT_MAP`
-- `UPDATE_SET_MAP`
-- `MERGE_SET_MAP`
-- `MERGE_INSERT_MAP`
-
-prefer a **concise value-source mapping set**.
-
-#### Preferred rule
-
-Emit mapping rows mainly for tokens that directly contribute to the resulting value written into the target column.
-
-Examples of preferred mapping sources:
-
-- arithmetic value inputs such as `AMT`, `TAX`, `RATE`
-- string-building value inputs such as `FIRST_NAME`, `LAST_NAME`
-- alternative value branches such as `X` and `Y` in `COALESCE(X, Y, 0)`
-- true source values in `CASE` result branches such as `THEN X ELSE Z`
-
-#### Usually do not emit mapping rows for
-
-Unless the implementation has a strong reason to do so, do **not** expand mapping rows to every control token in a complex expression, such as:
-
-- branch-control columns used only for predicates
-- comparison-only columns
-- boolean-condition columns
-- discriminator flags
-- structural literals used only to control logic
-- list-membership constants such as `IN (1,2,5,6)` when they do not themselves contribute value to the target
-
-These tokens should still appear in usage relationships like `SELECT_EXPR`, `WHERE`, `HAVING`, or `CONTROL_FLOW_CONDITION`, but they usually should **not** produce extra `*_MAP` rows.
-
-### Practical clarity rule
-
-For one complex target expression, it is often clearer to emit:
-
-- **many usage rows** for explainability
-- but only **one or a small number of mapping rows** for the main value sources
-
-This avoids overloading the TSV with noisy mappings while preserving both:
-
-- explainability
-- direct lineage usefulness
-
-### Example
-
-For:
-
-```sql
-INSERT INTO T_TARGET (CHARGE_AMOUNT)
-SELECT
-  SUM(CASE WHEN REC_SEQ_NUM IN (1,2,5,6) AND BROKER_CLNT_FLAG = 'C'
-           THEN AMT_BFORE_GST
-           ELSE 0 END)
-+ SUM(CASE WHEN BROKER_CLNT_FLAG = 'B'
-           THEN AMT_BFORE_GST - AMT_AFTER_GST
-           ELSE (AMT_AFTER_GST - AMT_BFORE_GST) END)
-FROM S;
-```
-
-Recommended extraction style:
-
-- usage rows may include:
-  - `REC_SEQ_NUM`
-  - `BROKER_CLNT_FLAG`
-  - `AMT_BFORE_GST`
-  - `AMT_AFTER_GST`
-  - relevant constants such as `'C'`, `'B'`, `0`, `1`, `2`, `5`, `6`
-
-- mapping rows should preferably focus on the main value contributors:
-  - `AMT_BFORE_GST -> T_TARGET.CHARGE_AMOUNT`
-  - `AMT_AFTER_GST -> T_TARGET.CHARGE_AMOUNT`
-
-This keeps the result readable without losing the important direct value lineage.
-
-### Short policy statement
-
-For complex expressions, usage relationships may capture all direct participating tokens, but `INSERT_SELECT_MAP`, `UPDATE_SET_MAP`, `MERGE_SET_MAP`, and `MERGE_INSERT_MAP` should preferably capture only the main direct value contributors to the written target, not every control or predicate token.
-
-## Relationship filling matrix
-
-### 1. Object-definition relationships
-
-#### `CREATE_VIEW`
-Meaning: defines a view object.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = created view
-- `target_field` = empty
-
-#### `CREATE_TABLE`
-Meaning: defines a table-like object, including DB2 session / DGTT-style table objects when applicable.
-- `source_field` = empty
-- `target_object_type` = resolved created object type
-- `target_object` = created object
-- `target_field` = empty
-
-#### `CREATE_PROCEDURE`
-Meaning: defines a stored procedure object.
-- `source_field` = empty
-- `target_object_type` = `PROCEDURE`
-- `target_object` = created procedure
-- `target_field` = empty
-
-#### `CREATE_FUNCTION`
-Meaning: defines a user-defined function object.
-- `source_field` = empty
-- `target_object_type` = `FUNCTION`
-- `target_object` = created function
-- `target_field` = empty
-
-### 2. Object-usage relationships
-
-#### `SELECT_TABLE`
-Meaning: statement directly reads a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE` or `SESSION_TABLE`
-- `target_object` = read object
-- `target_field` = empty
-
-#### `SELECT_VIEW`
-Meaning: statement directly reads a view.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = read view
-- `target_field` = empty
-
-#### `INSERT_TABLE`
-Meaning: statement inserts into an object.
-- `source_field` = empty
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = empty
-
-#### `UPDATE_TABLE`
-Meaning: statement updates an object.
-- `source_field` = empty
-- `target_object_type` = updated object type
-- `target_object` = updated object
-- `target_field` = empty
-
-#### `MERGE_INTO`
-Meaning: statement merges into an object.
-- `source_field` = empty
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = empty
-
-#### `DELETE_TABLE`
-Meaning: statement deletes from a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE`
-- `target_object` = deleted-from table
-- `target_field` = empty
-
-#### `DELETE_VIEW`
-Meaning: statement deletes from a view.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = deleted-from view
-- `target_field` = empty
-
-#### `TRUNCATE_TABLE`
-Meaning: statement truncates a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE`
-- `target_object` = truncated table
-- `target_field` = empty
-
-#### `CALL_FUNCTION`
-Meaning: statement directly invokes a function.
-- `source_field` = empty
-- `target_object_type` = `FUNCTION`
-- `target_object` = called function
-- `target_field` = empty
-
-#### `CALL_PROCEDURE`
-Meaning: statement directly invokes a procedure.
-- `source_field` = empty
-- `target_object_type` = `PROCEDURE`
-- `target_object` = called procedure
-- `target_field` = empty
-
-### 3. Target-column declaration relationships
-
-#### `INSERT_TARGET_COL`
-Meaning: an `INSERT (...)` target column slot is explicitly declared.
-- `source_field` = empty
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = declared target column
-- Emit this relationship only when the SQL text contains an explicit `INSERT (col1, col2, ...)` target-column list.
-
-#### `UPDATE_TARGET_COL`
-Meaning: a target column is assigned in an `UPDATE SET` clause.
-- `source_field` = empty
-- `target_object_type` = updated object type
-- `target_object` = updated object
-- `target_field` = target column being assigned
-
-#### `MERGE_TARGET_COL`
-Meaning: a target column is assigned in either branch of a `MERGE`.
-- `source_field` = empty
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column being updated or inserted
-
-### 4. Direct field-usage relationships
-
-#### `SELECT_FIELD`
-Meaning: a resolved field is directly projected in a `SELECT` list as a plain field projection, without additional expression wrapping.
-- `source_field` = projected field name
-- `target_object_type` = owning object type of that field
-- `target_object` = owning object
-- `target_field` = same resolved field
-
-#### `SELECT_EXPR`
-Meaning: a direct token participates in a `SELECT` expression or non-column select-list item.
-Use this for:
-- fields inside expressions
-- literals projected in the select list
-- special registers projected in the select list
-- computed expressions whose direct operands can be identified
-- `source_field` = participating token (field name or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-- `target_object` = owning object when applicable, otherwise a stable placeholder such as `UNKNOWN_SELECT_EXPR`
-- `target_field` = participating field when applicable, otherwise empty
-
-#### `UPDATE_SET`
-Meaning: a direct RHS token is used in an `UPDATE SET` assignment expression.
-- `source_field` = RHS participating token (field name or `CONSTANT:<VALUE>`)
-- `target_object_type` = updated target object type
-- `target_object` = updated target object
-- `target_field` = target column being assigned
-
-### 5. Field-mapping relationships (propagation-capable)
-
-**Precedence note:** More specific mappings take precedence over generic assignment mappings. Emit only the most specific relationship for the same direct semantic role.
-
-Specific relationships include:
-- `SPECIAL_REGISTER_MAP`
-- `DIAGNOSTICS_FETCH_MAP`
-- `FUNCTION_PARAM_MAP`
-- `CALL_PARAM_MAP`
-- `FUNCTION_EXPR_MAP`
-
-#### `CREATE_VIEW_MAP`
-Meaning: source column or direct literal maps into a created view column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = `VIEW`
-- `target_object` = target view
-- `target_field` = target view column
-
-#### `INSERT_SELECT_MAP`
-Meaning: source column or direct literal maps into an insert target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = insert target column
-
-#### `UPDATE_SET_MAP`
-Meaning: source column or direct literal maps into an updated target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = updated target type
-- `target_object` = updated target
-- `target_field` = updated target column
-
-#### `MERGE_SET_MAP`
-Meaning: source column or direct literal maps into a `MERGE` matched-update target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column
-
-#### `MERGE_INSERT_MAP`
-Meaning: source column or direct literal maps into a `MERGE` insert-branch target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column
-
-#### `VARIABLE_SET_MAP`
-Meaning: a source column, parameter, variable, literal, or direct expression operand is assigned into a declared variable.
-- `source_field` = direct source token or `CONSTANT:<VALUE>`
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable name
-
-#### `CURSOR_FETCH_MAP`
-Meaning: a source column from a cursor is mapped into a local variable or record slot during `FETCH` or implicit cursor iteration.
-- `source_field` = cursor column name
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable or record slot
-- Prefer qualified slot targets such as `V_REC.DEAL_NUM` when the target record structure is known.
-- If only the whole record variable is known, the record variable name may be used as a fallback.
-
-#### `FUNCTION_PARAM_MAP`
-Meaning: maps an actual argument into a called function's formal parameter.
-- `source_field` = actual argument token (field, variable, or `CONSTANT:<VALUE>`)
-- `target_object_type` = `FUNCTION`
-- `target_object` = called function
-- `target_field` = formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
-- Emit for scalar functions and table functions.
-
-#### `CALL_PARAM_MAP`
-Meaning: maps an actual argument into a called procedure parameter, or maps a procedure `OUT` / `INOUT` result into a receiving local variable.
-- `source_field` = actual argument token, or the procedure `OUT` / `INOUT` parameter token when receiving a returned value
-- `target_object_type` =
-  - `PROCEDURE` when passing into the callable
-  - `VARIABLE` when receiving an `OUT` / `INOUT` value locally
-- `target_object` =
-  - called procedure name when passing into the callable
-  - owning local routine when receiving the returned value
-- `target_field` =
-  - formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
-  - or receiving local variable name for `OUT` / `INOUT` result capture
-
-#### `TABLE_FUNCTION_RETURN_MAP`
-Meaning: a source column or direct literal maps into a table-valued function `RETURN` table definition.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = `FUNCTION`
-- `target_object` = owning function
-- `target_field` = target return column
-
-#### `SPECIAL_REGISTER_MAP`
-Meaning: a DB2 special register is directly mapped into a target column or variable.
-- `source_field` = `CONSTANT:<SPECIAL_REGISTER>`
-- `target_object_type` = target object type (`TABLE`, `VIEW`, or `VARIABLE`)
-- `target_object` = target object
-- `target_field` = target column or variable
-
-#### `DIAGNOSTICS_FETCH_MAP`
-Meaning: diagnostic information such as `SQLCODE`, `SQLSTATE`, or `GET DIAGNOSTICS` properties is fetched into a local variable.
-- `source_field` = diagnostic token such as `CONSTANT:SQLSTATE`
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable
-
-#### `FUNCTION_EXPR_MAP`
-Meaning: a function return value is used directly inside a field-level mapping expression.
-- `source_field` = called function name
-- `target_object_type` = target object type being modified
-- `target_object` = target object
-- `target_field` = target column or variable
-
-### 6. Predicate / condition relationships
-
-#### `WHERE`
-Meaning: a direct token participates in a `WHERE` predicate.
-- `source_field` = participating token (field or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning object type, or `CURSOR` for `WHERE CURRENT OF cursor_name`
-- `target_object` = owning object or cursor name
-- `target_field` = participating field when applicable, otherwise empty
-
-#### `JOIN_ON`
-Meaning: a direct token participates in a join condition.
-Same fill rule as `WHERE`.
-
-#### `MERGE_MATCH`
-Meaning: a direct token participates in the `MERGE ... ON ...` match condition.
-Same fill rule as `WHERE`.
-
-#### `GROUP_BY`
-Meaning: a direct field participates in grouping.
-Same fill rule as `WHERE`.
-
-#### `ORDER_BY`
-Meaning: a direct token participates in ordering.
-Same fill rule as `WHERE`.
-
-#### `HAVING`
-Meaning: a direct token participates in a `HAVING` predicate.
-
-Two valid forms are allowed:
-1. **Field-level / token-level** when a direct field or literal token can be resolved.
-   - `source_field` = participating token
-   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-   - `target_object` = owning object when applicable, otherwise `UNKNOWN_AGGREGATE`
-   - `target_field` = participating field when applicable, otherwise empty
-2. **Object-level fallback** when the expression has no stable direct token representation.
-   - `source_field` = empty
-   - `target_object_type` = owning object type or `UNKNOWN`
-   - `target_object` = owning object or `UNKNOWN_AGGREGATE`
-   - `target_field` = empty
-
-#### `CONTROL_FLOW_CONDITION`
-Meaning: a direct token participates in a procedural control-flow evaluation such as `IF`, `WHILE`, `CASE`, or `REPEAT`.
-- `source_field` = participating token (variable, field, or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
-- `target_object` = owning routine
-- `target_field` = participating variable or field when applicable, otherwise empty
-
-### 7. Intermediate / structural relationships
-
-#### `CTE_DEFINE`
-Meaning: defines a CTE object.
-- `source_field` = empty
-- `target_object_type` = `CTE`
-- `target_object` = CTE name
-- `target_field` = empty
-
-#### `CTE_READ`
-Meaning: statement reads a CTE object.
-- `source_field` = empty
-- `target_object_type` = `CTE`
-- `target_object` = CTE name
-- `target_field` = empty
-
-#### `UNION_INPUT`
-Meaning: the current select branch contributes one direct object input to a `UNION` / `UNION ALL` chain.
-- `source_field` = empty
-- `target_object_type` = concrete input object type
-- `target_object` = concrete input object
-- `target_field` = empty
-
-#### `CURSOR_DEFINE`
-Meaning: defines a named cursor and its associated `SELECT`.
-- `source_field` = empty
-- `target_object_type` = `CURSOR`
-- `target_object` = cursor name
-- `target_field` = empty
-
-#### `CURSOR_READ`
-Meaning: statement explicitly opens, fetches from, closes, or otherwise reads from a cursor.
-- `source_field` = empty
-- `target_object_type` = `CURSOR`
-- `target_object` = cursor name
-- `target_field` = empty
-
-#### `EXCEPTION_HANDLER_MAP`
-Meaning: an exception handler explicitly captures or redirects control flow/state based on an error condition.
-- `source_field` = caught condition token such as `CONSTANT:SQLEXCEPTION`, `CONSTANT:NOT FOUND`, `CONSTANT:'02000'`
-- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
-- `target_object` = owning routine
-- `target_field` = empty
-
-### 8. Return / execution relationships
-
-#### `RETURN_VALUE`
-Meaning: direct operand-level dependency of a **scalar** function `RETURN` expression.
-For table-valued functions, use `TABLE_FUNCTION_RETURN_MAP` instead.
-
-Valid forms:
-1. **Operand-level token dependency**
-   - `source_field` = direct operand token (field, variable, or `CONSTANT:<VALUE>`)
-   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-   - `target_object` = owning object when applicable, otherwise `UNKNOWN_RETURN_EXPR`
-   - `target_field` = participating field / variable when applicable, otherwise empty
-2. **Callable dependency**
-   - `source_field` = empty
-   - `target_object_type` = `FUNCTION`
-   - `target_object` = called function
-   - `target_field` = empty
-
-Examples:
-- `RETURN P_FACTOR * 2;` may emit:
-  - operand row for `P_FACTOR`
-  - operand row for `CONSTANT:2`
-- `RETURN MY_FUNC(V_X);` may emit:
-  - callable dependency row to `MY_FUNC`
-  - plus `FUNCTION_PARAM_MAP` rows for `V_X -> MY_FUNC.<param>`
-
-#### `DYNAMIC_SQL_EXEC`
-Meaning: a variable or literal containing dynamic SQL is executed, such as `EXECUTE IMMEDIATE`.
-- `source_field` = participating variable or string literal
-- `target_object_type` = `UNKNOWN`
-- `target_object` = `UNKNOWN_DYNAMIC_SQL`
-- `target_field` = empty
-
-### 9. Unknown / unresolved relationships
-
-#### `UNKNOWN`
-Meaning: a direct statement exists but cannot yet be expressed as a stronger supported relationship.
-- `source_field` = empty unless a direct unresolved token is important for review
-- `target_object_type` = `UNKNOWN`
-- `target_object` = one of:
-  - `UNKNOWN_UNSUPPORTED_STATEMENT`
-  - `UNKNOWN_UNRESOLVED_OBJECT`
-  - another stable, truthful placeholder of the same class
-- `target_field` = empty
-
-## Optional validation guidance
-
-A validator should flag at least these defect classes:
-- invalid header
-- invalid relationship value
-- invalid confidence value
-- duplicate rows
-- inconsistent `line_relation_seq` within a line group
-- `line_no` not matching the real SQL file
-- `line_content` not matching the real SQL file
-- rows that violate explicit contract rules such as:
-  - `INSERT_TARGET_COL` emitted without an explicit target-column list
-  - `SELECT_FIELD` emitted for a literal projection
-  - mixed named and positional parameter targets for the same callable when the signature is known
+CREATE PROCEDURE RPT.PR_TEST_DEMO
+(
+    IN p_product_type VARCHAR(2),
+    IN p_deal_type    VARCHAR(2)
+)
+SPECIFIC PR_TEST_DEMO
+LANGUAGE SQL
+RESULT SETS 0
+BEGIN
+
+    -------------------------------------------------------------------------
+    -- Variable declaration
+    -------------------------------------------------------------------------
+    DECLARE lv_msg_category            VARCHAR(30)  DEFAULT 'ARG';
+    DECLARE lv_procedure_name          VARCHAR(100) DEFAULT 'RPT.PR_TEST_DEMO';
+    DECLARE lv_err_pos                 VARCHAR(1000);
+    DECLARE lv_message_text            VARCHAR(1024);
+    DECLARE lv_error_message           VARCHAR(3000);
+    DECLARE lv_sqlstate                CHAR(5) DEFAULT '00000';
+    DECLARE lv_region_code             VARCHAR(3);
+    DECLARE lv_month_flag              CHAR(1);
+    DECLARE lv_source_system           VARCHAR(10) DEFAULT 'STO';
+    DECLARE lv_process_status          VARCHAR(20) DEFAULT 'START';
+    DECLARE lv_batch_comment           VARCHAR(500);
+    DECLARE lv_row_count               INTEGER DEFAULT 0;
+    DECLARE lv_insert_count            INTEGER DEFAULT 0;
+    DECLARE lv_update_count            INTEGER DEFAULT 0;
+    DECLARE lv_merge_count             INTEGER DEFAULT 0;
+    DECLARE lv_has_data                SMALLINT DEFAULT 0;
+
+    DECLARE ld_biz_date                DATE;
+    DECLARE ld_last_biz_date           DATE;
+    DECLARE ld_next_biz_date           DATE;
+    DECLARE ld_actual_month_begin_date DATE;
+    DECLARE ld_actual_month_end_date   DATE;
+    DECLARE ld_end_date                DATE;
+
+    DECLARE ln_sqlcode                 INT DEFAULT 0;
+
+    -------------------------------------------------------------------------
+    -- Cursor variables
+    -------------------------------------------------------------------------
+    DECLARE cv_customer_number         VARCHAR(30);
+    DECLARE cv_sub_account_number      VARCHAR(30);
+    DECLARE cv_deal_number             VARCHAR(30);
+    DECLARE cv_deal_sub_number         VARCHAR(30);
+    DECLARE cv_event_id                VARCHAR(100);
+    DECLARE cv_sequence_number         BIGINT;
+    DECLARE cv_premium_amount          DECIMAL(31,10);
+    DECLARE cv_settlement_amount       DECIMAL(31,10);
+    DECLARE cv_trade_ccy               VARCHAR(10);
+    DECLARE cv_settlement_ccy          VARCHAR(10);
+    DECLARE cv_option_style            VARCHAR(10);
+    DECLARE cv_expiry_date             DATE;
+    DECLARE cv_exercise_date           DATE;
+    DECLARE cv_knock_in_flag           CHAR(1);
+    DECLARE cv_knock_out_flag          CHAR(1);
+
+    DECLARE at_end                     SMALLINT DEFAULT 0;
+
+    -------------------------------------------------------------------------
+    -- Temporary table
+    -------------------------------------------------------------------------
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_STO_EVENT_SOURCE
+    (
+        CUSTOMER_NUMBER        VARCHAR(30),
+        SUB_ACCOUNT_NUMBER     VARCHAR(30),
+        DEAL_NUMBER            VARCHAR(30),
+        DEAL_SUB_NUMBER        VARCHAR(30),
+        PRODUCT_TYPE           VARCHAR(2),
+        DEAL_TYPE              VARCHAR(2),
+        EVENT_CLASS            VARCHAR(10),
+        EVENT_DATE             DATE,
+        EVENT_ID               VARCHAR(100),
+        PREMIUM_AMOUNT         DECIMAL(31,10),
+        SETTLEMENT_AMOUNT      DECIMAL(31,10),
+        TRADE_CCY              VARCHAR(10),
+        SETTLEMENT_CCY         VARCHAR(10),
+        OPTION_STYLE           VARCHAR(10),
+        STRIKE_PRICE           DECIMAL(31,10),
+        NOTIONAL_AMOUNT        DECIMAL(31,10),
+        KNOCK_IN_FLAG          CHAR(1),
+        KNOCK_OUT_FLAG         CHAR(1),
+        EXPIRY_DATE            DATE,
+        EXERCISE_DATE          DATE,
+        COMPANY_CODE           VARCHAR(20),
+        BRANCH_CODE            VARCHAR(20)
+    )
+    WITH REPLACE
+    ON COMMIT PRESERVE ROWS
+    NOT LOGGED;
+
+    -------------------------------------------------------------------------
+    -- Exception handling
+    -------------------------------------------------------------------------
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        SET ln_sqlcode = SQLCODE;
+        SET lv_sqlstate = SQLSTATE;
+
+        GET DIAGNOSTICS EXCEPTION 1 lv_message_text = MESSAGE_TEXT;
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+
+        ROLLBACK;
+
+        SET lv_error_message =
+              lv_procedure_name || ' failed.'
+           || ' Product Type: ' || COALESCE(p_product_type, '')
+           || ' Deal Type: '    || COALESCE(p_deal_type, '')
+           || ' Err Pos: '      || COALESCE(lv_err_pos, '')
+           || ' Message: '      || COALESCE(lv_message_text, '')
+           || ' SQLSTATE: '     || COALESCE(lv_sqlstate, '')
+           || ' SQLCODE: '      || CHAR(ln_sqlcode)
+           || ' ROW_COUNT: '    || CHAR(lv_row_count);
+
+        CALL TEMP.PR_PROCEDURE_LOG(
+            lv_msg_category,
+            lv_procedure_name,
+            'ERROR',
+            lv_error_message
+        );
+
+        COMMIT;
+    END;
+
+    -------------------------------------------------------------------------
+    -- Continue handler for cursor end
+    -------------------------------------------------------------------------
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET at_end = 1;
+
+    -------------------------------------------------------------------------
+    -- Cursor declaration
+    -------------------------------------------------------------------------
+    DECLARE c_event_detail CURSOR FOR
+        SELECT MAST.CUSTOMER_NUMBER,
+               MAST.SUB_ACCOUNT_NUMBER,
+               MAST.DEAL_NUMBER,
+               MAST.DEAL_SUB_NUMBER,
+               MAST.EVENT_ID,
+               MAST.SEQUENCE_NUMBER,
+               SRC.PREMIUM_AMOUNT,
+               SRC.SETTLEMENT_AMOUNT,
+               SRC.TRADE_CCY,
+               SRC.SETTLEMENT_CCY,
+               SRC.OPTION_STYLE,
+               SRC.EXPIRY_DATE,
+               SRC.EXERCISE_DATE,
+               SRC.KNOCK_IN_FLAG,
+               SRC.KNOCK_OUT_FLAG
+          FROM TEMP.TEST_EVENT_MASTER_P MAST
+          INNER JOIN SESSION.TMP_STO_EVENT_SOURCE SRC
+            ON SRC.CUSTOMER_NUMBER    = MAST.CUSTOMER_NUMBER
+           AND SRC.SUB_ACCOUNT_NUMBER = MAST.SUB_ACCOUNT_NUMBER
+           AND SRC.DEAL_NUMBER        = MAST.DEAL_NUMBER
+           AND SRC.DEAL_SUB_NUMBER    = MAST.DEAL_SUB_NUMBER
+           AND SRC.EVENT_ID           = MAST.EVENT_ID
+         WHERE MAST.PRODUCT_TYPE      = p_product_type
+           AND MAST.DEAL_TYPE         = p_deal_type
+           AND MAST.CREATION_DATE     = ld_biz_date
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+    -------------------------------------------------------------------------
+    -- Start log
+    -------------------------------------------------------------------------
+    CALL TEMP.PR_PROCEDURE_LOG(
+        lv_msg_category,
+        lv_procedure_name,
+        'INFO',
+        'Start CALL RPT.PR_TEST_DEMO()'
+    );
+
+    -------------------------------------------------------------------------
+    -- Get business date / parameters
+    -------------------------------------------------------------------------
+    SET lv_err_pos = 'Position: Get business date and control parameters';
+
+    SELECT BIZ_DT,
+           PREV_BIZ_DT,
+           NEXT_BIZ_DT,
+           MONTH_FLAG,
+           REGION_CD
+      INTO ld_biz_date,
+           ld_last_biz_date,
+           ld_next_biz_date,
+           lv_month_flag,
+           lv_region_code
+      FROM TEMP.SYS_WHERE
+     WHERE SYS_CD = 'FOS';
+
+    SET ld_actual_month_begin_date = TEMP.FN_GET_ACTUAL_MONTH_BEGIN_DATE();
+    SET ld_actual_month_end_date   = TEMP.FN_GET_ACTUAL_MONTH_END_DATE();
+
+    SET ld_end_date =
+        CASE
+            WHEN lv_month_flag = 'E' THEN ld_actual_month_end_date
+            ELSE ld_biz_date
+        END;
+
+    SET lv_batch_comment =
+          'biz_date=' || CHAR(ld_biz_date)
+       || ', prev_biz_date=' || CHAR(ld_last_biz_date)
+       || ', next_biz_date=' || CHAR(ld_next_biz_date)
+       || ', region=' || COALESCE(lv_region_code, '')
+       || ', month_flag=' || COALESCE(lv_month_flag, '');
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+        lv_msg_category,
+        lv_procedure_name,
+        'INFO',
+        lv_batch_comment
+    );
+
+    -------------------------------------------------------------------------
+    -- Clean temp table
+    -------------------------------------------------------------------------
+    SET lv_err_pos = 'Position: Clean temp table';
+
+    DELETE FROM SESSION.TMP_STO_EVENT_SOURCE;
+
+    -------------------------------------------------------------------------
+    -- Clear old data for rerun
+    -------------------------------------------------------------------------
+    SET lv_err_pos = 'Position: Clear rerun data';
+
+    DELETE FROM TEMP.TEST_EVENT_DETAIL_P DETL
+     WHERE DETL.PRODUCT_TYPE   = p_product_type
+       AND DETL.DEAL_TYPE      = p_deal_type
+       AND DETL.CREATION_DATE  = ld_biz_date
+       AND DETL.EVENT_ID LIKE 'OTC_STO_%';
+
+    DELETE FROM TEMP.TEST_EVENT_MASTER_P MAST
+     WHERE MAST.PRODUCT_TYPE   = p_product_type
+       AND MAST.DEAL_TYPE      = p_deal_type
+       AND MAST.CREATION_DATE  = ld_biz_date
+       AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+    COMMIT;
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+        lv_msg_category,
+        lv_procedure_name,
+        'INFO',
+        'Old rerun data deleted'
+    );
+
+    -------------------------------------------------------------------------
+    -- Load source events into temp table
+    -------------------------------------------------------------------------
+    SET lv_err_pos = 'Position: Load source event rows into temp table';
+
+    INSERT INTO SESSION.TMP_STO_EVENT_SOURCE
+    (
+        CUSTOMER_NUMBER,
+        SUB_ACCOUNT_NUMBER,
+        DEAL_NUMBER,
+        DEAL_SUB_NUMBER,
+        PRODUCT_TYPE,
+        DEAL_TYPE,
+        EVENT_CLASS,
+        EVENT_DATE,
+        EVENT_ID,
+        PREMIUM_AMOUNT,
+        SETTLEMENT_AMOUNT,
+        TRADE_CCY,
+        SETTLEMENT_CCY,
+        OPTION_STYLE,
+        STRIKE_PRICE,
+        NOTIONAL_AMOUNT,
+        KNOCK_IN_FLAG,
+        KNOCK_OUT_FLAG,
+        EXPIRY_DATE,
+        EXERCISE_DATE,
+        COMPANY_CODE,
+        BRANCH_CODE
+    )
+    SELECT DEAL.CUSTOMER_NUMBER,
+           DEAL.SUB_ACCOUNT_NUMBER,
+           DEAL.DEAL_NUMBER,
+           DEAL.DEAL_SUB_NUMBER,
+           DEAL.PROD_TYPE,
+           DEAL.DEAL_TYPE,
+           CASE
+               WHEN DEAL.TRADE_DATE = ld_biz_date THEN 'TRADE'
+               WHEN DEAL.PREMIUM_DATE = ld_biz_date THEN 'PREMIUM'
+               WHEN DEAL.EXERCISE_DATE = ld_biz_date AND DEAL.EXERCISED_FLAG = 'Y' THEN 'EXERCISE'
+               WHEN DEAL.EXPIRY_DATE = ld_biz_date AND COALESCE(DEAL.EXERCISED_FLAG, 'N') = 'N' THEN 'EXPIRY'
+               WHEN DEAL.MATURITY_DATE = ld_biz_date THEN 'MATURITY'
+               ELSE 'OTHER'
+           END,
+           CASE
+               WHEN DEAL.TRADE_DATE = ld_biz_date THEN DEAL.TRADE_DATE
+               WHEN DEAL.PREMIUM_DATE = ld_biz_date THEN DEAL.PREMIUM_DATE
+               WHEN DEAL.EXERCISE_DATE = ld_biz_date THEN DEAL.EXERCISE_DATE
+               WHEN DEAL.EXPIRY_DATE = ld_biz_date THEN DEAL.EXPIRY_DATE
+               ELSE DEAL.MATURITY_DATE
+           END,
+           CASE
+               WHEN DEAL.TRADE_DATE = ld_biz_date AND DEAL.BUY_SELL_FLAG = 'B'
+                    THEN 'OTC_STO_PURCHASE_TRADE_DATE'
+               WHEN DEAL.TRADE_DATE = ld_biz_date AND DEAL.BUY_SELL_FLAG = 'S'
+                    THEN 'OTC_STO_WRITTEN_TRADE_DATE'
+               WHEN DEAL.PREMIUM_DATE = ld_biz_date AND DEAL.BUY_SELL_FLAG = 'B'
+                    THEN 'OTC_STO_PURCHASE_PREMIUM_DATE'
+               WHEN DEAL.PREMIUM_DATE = ld_biz_date AND DEAL.BUY_SELL_FLAG = 'S'
+                    THEN 'OTC_STO_WRITTEN_PREMIUM_DATE'
+               WHEN DEAL.EXERCISE_DATE = ld_biz_date AND DEAL.EXERCISED_FLAG = 'Y'
+                    THEN 'OTC_STO_EXERCISE_DATE'
+               WHEN DEAL.EXPIRY_DATE = ld_biz_date AND COALESCE(DEAL.EXERCISED_FLAG, 'N') = 'N'
+                    THEN 'OTC_STO_EXPIRY_DATE'
+               WHEN DEAL.MATURITY_DATE = ld_biz_date AND DEAL.BUY_SELL_FLAG = 'B'
+                    THEN 'OTC_STO_PURCHASE_MATURITY_DATE'
+               ELSE 'OTC_STO_WRITTEN_MATURITY_DATE'
+           END,
+           DEAL.PREMIUM_AMOUNT,
+           CASE
+               WHEN POSN.CLOSE_OUT_AMOUNT IS NOT NULL THEN POSN.CLOSE_OUT_AMOUNT
+               WHEN DEAL.SETTLEMENT_AMOUNT IS NOT NULL THEN DEAL.SETTLEMENT_AMOUNT
+               ELSE 0
+           END,
+           DEAL.TRADE_CCY,
+           DEAL.SETTLEMENT_CCY,
+           DEAL.OPTION_STYLE,
+           DEAL.STRIKE_PRICE,
+           DEAL.NOTIONAL_AMOUNT,
+           COALESCE(DEAL.KNOCK_IN_FLAG, 'N'),
+           COALESCE(DEAL.KNOCK_OUT_FLAG, 'N'),
+           DEAL.EXPIRY_DATE,
+           DEAL.EXERCISE_DATE,
+           DEAL.COMPANY_CODE,
+           DEAL.BRANCH_CODE
+      FROM TEMP.STRUCTURED_OPTION_DEAL_BEF_EOD DEAL
+      LEFT OUTER JOIN TEMP.OTC_STO_POSITION POSN
+        ON POSN.CUSTOMER_NUMBER    = DEAL.CUSTOMER_NUMBER
+       AND POSN.SUB_ACCOUNT_NUMBER = DEAL.SUB_ACCOUNT_NUMBER
+       AND POSN.DEAL_TYPE          = DEAL.DEAL_TYPE
+       AND POSN.DEAL_NUMBER        = DEAL.DEAL_NUMBER
+       AND POSN.DEAL_SUB_NUMBER    = DEAL.DEAL_SUB_NUMBER
+      LEFT OUTER JOIN TEMP.STRUCTURED_OPTION_TEMPLATE TMPL
+        ON TMPL.TEMPLATE_CODE      = DEAL.TEMPLATE_CODE
+     WHERE DEAL.PROD_TYPE          = p_product_type
+       AND DEAL.DEAL_TYPE          = p_deal_type
+       AND DEAL.REVERSE_TS IS NULL
+       AND DEAL.STATUS IN ('A', 'L', 'P')
+       AND TMPL.TEMPLATE_CODE IS NOT NULL
+       AND
+       (
+            DEAL.TRADE_DATE     = ld_biz_date
+         OR DEAL.PREMIUM_DATE   = ld_biz_date
+         OR DEAL.EXERCISE_DATE  = ld_biz_date
+         OR DEAL.EXPIRY_DATE    = ld_biz_date
+         OR DEAL.MATURITY_DATE  = ld_biz_date
+       );
+
+    GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+    SET lv_insert_count = lv_insert_count + lv_row_count;
+
+    COMMIT;
+
+    -------------------------------------------------------------------------
+    -- Check if data exists
+    -------------------------------------------------------------------------
+    SET lv_err_pos = 'Position: Check temp source data';
+
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM SESSION.TMP_STO_EVENT_SOURCE) THEN 1 ELSE 0 END
+      INTO lv_has_data
+      FROM SYSIBM.SYSDUMMY1;
+
+    IF lv_has_data = 0 THEN
+
+        CALL TEMP.PR_PROCEDURE_LOG(
+            lv_msg_category,
+            lv_procedure_name,
+            'INFO',
+            'No source rows found for structured option events'
+        );
+
+    ELSE
+
+        ---------------------------------------------------------------------
+        -- Insert ACCOUNT_EVENT_MASTER_P
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Insert ACCOUNT_EVENT_MASTER_P';
+
+        INSERT INTO TEMP.TEST_EVENT_MASTER_P
+        (
+            ACTIVE_FLAG,
+            CREATION_DATE,
+            AS_OF_DATE,
+            PRODUCT_TYPE,
+            DEAL_TYPE,
+            EVENT_ID,
+            SEQUENCE_NUMBER,
+            DEAL_WITH_COMPANY,
+            DEAL_WITH_BRANCH,
+            CUSTOMER_NUMBER,
+            SUB_ACCOUNT_NUMBER,
+            DEAL_NUMBER,
+            DEAL_SUB_NUMBER
+        )
+        SELECT 'A',
+               ld_biz_date,
+               ld_biz_date,
+               SRC.PRODUCT_TYPE,
+               SRC.DEAL_TYPE,
+               SRC.EVENT_ID,
+               NEXT VALUE FOR RPT.GLOBAL_SEQ_ACCOUNT_EVENT_UNIQUE_ID,
+               SRC.COMPANY_CODE,
+               SRC.BRANCH_CODE,
+               SRC.CUSTOMER_NUMBER,
+               SRC.SUB_ACCOUNT_NUMBER,
+               SRC.DEAL_NUMBER,
+               SRC.DEAL_SUB_NUMBER
+          FROM SESSION.TMP_STO_EVENT_SOURCE SRC;
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_insert_count = lv_insert_count + lv_row_count;
+
+        COMMIT;
+
+        ---------------------------------------------------------------------
+        -- Insert static detail rows
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Insert static detail rows';
+
+        INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+        (
+            ACTIVE_FLAG,
+            CREATION_DATE,
+            AS_OF_DATE,
+            PRODUCT_TYPE,
+            DEAL_TYPE,
+            EVENT_ID,
+            SEQUENCE_NUMBER,
+            FIELD_NAME,
+            FIELD_VALUE
+        )
+        SELECT MAST.ACTIVE_FLAG,
+               ld_biz_date,
+               MAST.AS_OF_DATE,
+               MAST.PRODUCT_TYPE,
+               MAST.DEAL_TYPE,
+               MAST.EVENT_ID,
+               MAST.SEQUENCE_NUMBER,
+               'SOURCE_SYSTEM',
+               lv_source_system
+          FROM TEMP.TEST_EVENT_MASTER_P MAST
+         WHERE MAST.PRODUCT_TYPE  = p_product_type
+           AND MAST.DEAL_TYPE     = p_deal_type
+           AND MAST.CREATION_DATE = ld_biz_date
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_insert_count = lv_insert_count + lv_row_count;
+
+        INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+        (
+            ACTIVE_FLAG,
+            CREATION_DATE,
+            AS_OF_DATE,
+            PRODUCT_TYPE,
+            DEAL_TYPE,
+            EVENT_ID,
+            SEQUENCE_NUMBER,
+            FIELD_NAME,
+            FIELD_VALUE
+        )
+        SELECT MAST.ACTIVE_FLAG,
+               ld_biz_date,
+               MAST.AS_OF_DATE,
+               MAST.PRODUCT_TYPE,
+               MAST.DEAL_TYPE,
+               MAST.EVENT_ID,
+               MAST.SEQUENCE_NUMBER,
+               'REGION_CODE',
+               COALESCE(lv_region_code, '')
+          FROM TEMP.TEST_EVENT_MASTER_P MAST
+         WHERE MAST.PRODUCT_TYPE  = p_product_type
+           AND MAST.DEAL_TYPE     = p_deal_type
+           AND MAST.CREATION_DATE = ld_biz_date
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_insert_count = lv_insert_count + lv_row_count;
+
+        COMMIT;
+
+        ---------------------------------------------------------------------
+        -- Insert detail rows using cursor
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Insert dynamic detail rows by cursor';
+
+        SET at_end = 0;
+        OPEN c_event_detail;
+
+        fetch_loop:
+        LOOP
+            FETCH c_event_detail
+             INTO cv_customer_number,
+                  cv_sub_account_number,
+                  cv_deal_number,
+                  cv_deal_sub_number,
+                  cv_event_id,
+                  cv_sequence_number,
+                  cv_premium_amount,
+                  cv_settlement_amount,
+                  cv_trade_ccy,
+                  cv_settlement_ccy,
+                  cv_option_style,
+                  cv_expiry_date,
+                  cv_exercise_date,
+                  cv_knock_in_flag,
+                  cv_knock_out_flag;
+
+            IF at_end = 1 THEN
+                LEAVE fetch_loop;
+            END IF;
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'PREMIUM_AMOUNT',
+                COALESCE(CHAR(cv_premium_amount), '0')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'SETTLEMENT_AMOUNT',
+                COALESCE(CHAR(cv_settlement_amount), '0')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'TRADE_CCY',
+                COALESCE(cv_trade_ccy, '')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'SETTLEMENT_CCY',
+                COALESCE(cv_settlement_ccy, '')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'OPTION_STYLE',
+                COALESCE(cv_option_style, '')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'KNOCK_IN_FLAG',
+                COALESCE(cv_knock_in_flag, 'N')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'KNOCK_OUT_FLAG',
+                COALESCE(cv_knock_out_flag, 'N')
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'EXPIRY_DATE',
+                CASE WHEN cv_expiry_date IS NULL THEN '' ELSE CHAR(cv_expiry_date) END
+            );
+
+            INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+            (
+                ACTIVE_FLAG,
+                CREATION_DATE,
+                AS_OF_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_ID,
+                SEQUENCE_NUMBER,
+                FIELD_NAME,
+                FIELD_VALUE
+            )
+            VALUES
+            (
+                'A',
+                ld_biz_date,
+                ld_biz_date,
+                p_product_type,
+                p_deal_type,
+                cv_event_id,
+                cv_sequence_number,
+                'EXERCISE_DATE',
+                CASE WHEN cv_exercise_date IS NULL THEN '' ELSE CHAR(cv_exercise_date) END
+            );
+
+            SET lv_insert_count = lv_insert_count + 9;
+        END LOOP;
+
+        CLOSE c_event_detail;
+
+        COMMIT;
+
+        ---------------------------------------------------------------------
+        -- Update original deal number and deal sub number from SOD
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Update original deal number from SOD';
+
+        UPDATE TEMP.TEST_EVENT_MASTER_P MAST
+           SET (MAST.DEAL_NUMBER, MAST.DEAL_SUB_NUMBER) =
+               (
+                   SELECT SOD.ORIG_DEAL_NUM,
+                          SOD.ORIG_DEAL_SB_NUM
+                     FROM TEMP.STRUCTURED_OPTION_SOD SOD
+                    WHERE SOD.CUST_NUM    = MAST.CUSTOMER_NUMBER
+                      AND SOD.SB_ACCT_NUM = MAST.SUB_ACCOUNT_NUMBER
+                      AND SOD.DEAL_NUM    = MAST.DEAL_NUMBER
+                      AND SOD.DEAL_SB_NUM = MAST.DEAL_SUB_NUMBER
+                    FETCH FIRST 1 ROW ONLY
+               )
+         WHERE MAST.PRODUCT_TYPE  = p_product_type
+           AND MAST.DEAL_TYPE     = p_deal_type
+           AND MAST.CREATION_DATE = ld_biz_date
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%'
+           AND EXISTS
+               (
+                   SELECT 1
+                     FROM TEMP.STRUCTURED_OPTION_SOD SOD
+                    WHERE SOD.CUST_NUM    = MAST.CUSTOMER_NUMBER
+                      AND SOD.SB_ACCT_NUM = MAST.SUB_ACCOUNT_NUMBER
+                      AND SOD.DEAL_NUM    = MAST.DEAL_NUMBER
+                      AND SOD.DEAL_SB_NUM = MAST.DEAL_SUB_NUMBER
+               );
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_update_count = lv_update_count + lv_row_count;
+
+        COMMIT;
+
+        ---------------------------------------------------------------------
+        -- Merge summary information into summary table
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Merge into summary table';
+
+        MERGE INTO TEMP.TEST_EVENT_DAILY_SUMMARY T
+        USING
+        (
+            SELECT ld_biz_date AS BIZ_DATE,
+                   p_product_type AS PRODUCT_TYPE,
+                   p_deal_type AS DEAL_TYPE,
+                   COUNT(*) AS EVENT_COUNT
+              FROM TEMP.TEST_EVENT_MASTER_P MAST
+             WHERE MAST.CREATION_DATE = ld_biz_date
+               AND MAST.PRODUCT_TYPE  = p_product_type
+               AND MAST.DEAL_TYPE     = p_deal_type
+               AND MAST.EVENT_ID LIKE 'OTC_STO_%'
+        ) S
+        ON T.BIZ_DATE      = S.BIZ_DATE
+       AND T.PRODUCT_TYPE  = S.PRODUCT_TYPE
+       AND T.DEAL_TYPE     = S.DEAL_TYPE
+        WHEN MATCHED THEN
+            UPDATE SET
+                T.EVENT_COUNT  = S.EVENT_COUNT,
+                T.UPDATE_TS    = CURRENT TIMESTAMP,
+                T.UPDATE_USER  = lv_procedure_name
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                BIZ_DATE,
+                PRODUCT_TYPE,
+                DEAL_TYPE,
+                EVENT_COUNT,
+                CREATE_TS,
+                CREATE_USER
+            )
+            VALUES
+            (
+                S.BIZ_DATE,
+                S.PRODUCT_TYPE,
+                S.DEAL_TYPE,
+                S.EVENT_COUNT,
+                CURRENT TIMESTAMP,
+                lv_procedure_name
+            );
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_merge_count = lv_merge_count + lv_row_count;
+
+        COMMIT;
+
+        ---------------------------------------------------------------------
+        -- Additional detail rows for derived business flags
+        ---------------------------------------------------------------------
+        SET lv_err_pos = 'Position: Insert derived business detail rows';
+
+        INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+        (
+            ACTIVE_FLAG,
+            CREATION_DATE,
+            AS_OF_DATE,
+            PRODUCT_TYPE,
+            DEAL_TYPE,
+            EVENT_ID,
+            SEQUENCE_NUMBER,
+            FIELD_NAME,
+            FIELD_VALUE
+        )
+        SELECT 'A',
+               ld_biz_date,
+               ld_biz_date,
+               p_product_type,
+               p_deal_type,
+               MAST.EVENT_ID,
+               MAST.SEQUENCE_NUMBER,
+               'MONTH_END_FLAG',
+               CASE
+                   WHEN lv_month_flag = 'E' THEN 'Y'
+                   ELSE 'N'
+               END
+          FROM TEMP.TEST_EVENT_MASTER_P MAST
+         WHERE MAST.CREATION_DATE = ld_biz_date
+           AND MAST.PRODUCT_TYPE  = p_product_type
+           AND MAST.DEAL_TYPE     = p_deal_type
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_insert_count = lv_insert_count + lv_row_count;
+
+        INSERT INTO TEMP.TEST_EVENT_DETAIL_P
+        (
+            ACTIVE_FLAG,
+            CREATION_DATE,
+            AS_OF_DATE,
+            PRODUCT_TYPE,
+            DEAL_TYPE,
+            EVENT_ID,
+            SEQUENCE_NUMBER,
+            FIELD_NAME,
+            FIELD_VALUE
+        )
+        SELECT 'A',
+               ld_biz_date,
+               ld_biz_date,
+               p_product_type,
+               p_deal_type,
+               MAST.EVENT_ID,
+               MAST.SEQUENCE_NUMBER,
+               'PROCESS_STATUS',
+               lv_process_status
+          FROM TEMP.TEST_EVENT_MASTER_P MAST
+         WHERE MAST.CREATION_DATE = ld_biz_date
+           AND MAST.PRODUCT_TYPE  = p_product_type
+           AND MAST.DEAL_TYPE     = p_deal_type
+           AND MAST.EVENT_ID LIKE 'OTC_STO_%';
+
+        GET DIAGNOSTICS lv_row_count = ROW_COUNT;
+        SET lv_insert_count = lv_insert_count + lv_row_count;
+
+        COMMIT;
+
+    END IF;
+
+    -------------------------------------------------------------------------
+    -- End log
+    -------------------------------------------------------------------------
+    SET lv_batch_comment =
+          'Completed. inserted=' || CHAR(lv_insert_count)
+       || ', updated=' || CHAR(lv_update_count)
+       || ', merged=' || CHAR(lv_merge_count);
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+        lv_msg_category,
+        lv_procedure_name,
+        'INFO',
+        lv_batch_comment
+    );
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+        lv_msg_category,
+        lv_procedure_name,
+        'INFO',
+        'End CALL RPT.PR_TEST_DEMO()'
+    );
+
+END
+@
+
+CREATE PROCEDURE TEMP.PR_EXTRACT_LOAN_RISK_DTL ()
+LANGUAGE SQL
+SPECIFIC PR_EXTRACT_LOAN_RISK_DTL
+BEGIN
+
+    /***************************************************************
+    * 
+    * ALL RIGHTS RESERVED.
+    *
+    * Procedure Name : TEMP.PR_EXTRACT_LOAN_RISK_DTL
+    * Purpose        : Extract daily loan risk detail report
+    * Author         : ChatGPT
+    * Created On     : 2026-04-10
+    *
+    * Amendment History:
+    * --------------------------------------------------------------
+    * Amended By   Amended On   Description
+    * -----------  -----------  ------------------------------------
+    * ChatGPT      10 Apr 2026  Initial version
+    ***************************************************************/
+
+    ----------------------------------------------------------------
+    -- Variable declarations
+    ----------------------------------------------------------------
+    DECLARE l_report_date           DATE;
+    DECLARE l_next_business_date    DATE;
+    DECLARE l_country_code          CHAR(2);
+    DECLARE l_site_code             CHAR(5) DEFAULT '00000';
+    DECLARE l_reporting_ccy         VARCHAR(3);
+    DECLARE l_is_hk                 CHAR(1);
+    DECLARE l_is_sg                 CHAR(1);
+    DECLARE l_batch_id              VARCHAR(30);
+    DECLARE l_sql_str               VARCHAR(2000);
+    DECLARE l_ctrl_flag             CHAR(1) DEFAULT 'N';
+    DECLARE l_row_cnt               INTEGER DEFAULT 0;
+    DECLARE l_warn_msg              VARCHAR(1000);
+    DECLARE l_err_msg               VARCHAR(1000);
+
+    ----------------------------------------------------------------
+    -- Exception handling
+    ----------------------------------------------------------------
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 l_err_msg = MESSAGE_TEXT;
+
+        CALL TEMP.PR_PROCEDURE_LOG(
+              'FORMAT'
+            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+            , 'ERROR'
+            , COALESCE(l_err_msg, 'UNKNOWN SQL EXCEPTION')
+        );
+
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+    BEGIN
+        SET l_warn_msg = 'NOT FOUND CONDITION ENCOUNTERED';
+        CALL TEMP.PR_PROCEDURE_LOG(
+              'FORMAT'
+            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+            , 'WARN'
+            , l_warn_msg
+        );
+    END;
+
+    ----------------------------------------------------------------
+    -- Initialize runtime variables
+    ----------------------------------------------------------------
+    SET l_report_date        = CURRENT DATE - 1 DAY;
+    SET l_next_business_date = CURRENT DATE;
+    SET l_country_code       = 'HK';
+    SET l_reporting_ccy      = 'HKD';
+    SET l_is_hk              = 'Y';
+    SET l_is_sg              = 'N';
+    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+          'FORMAT'
+        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+        , 'INFO'
+        , 'Procedure started. Batch=' || l_batch_id
+    );
+
+    ----------------------------------------------------------------
+    -- Read control / config flag
+    ----------------------------------------------------------------
+    SELECT COALESCE(MAX(ctrl_flag), 'N')
+      INTO l_ctrl_flag
+      FROM CFG.RPT_CONTROL
+     WHERE process_name = 'PR_EXTRACT_LOAN_RISK_DTL';
+
+    ----------------------------------------------------------------
+    -- Clear target table
+    ----------------------------------------------------------------
+    SET l_sql_str =
+        'ALTER TABLE RPT.RPT_LOAN_RISK_DTL ACTIVATE NOT LOGGED INITIALLY WITH EMPTY TABLE';
+
+    EXECUTE IMMEDIATE l_sql_str;
+    COMMIT;
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+          'FORMAT'
+        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+        , 'INFO'
+        , 'Target table cleared'
+    );
+
+    ----------------------------------------------------------------
+    -- Temporary table: base loan data
+    ----------------------------------------------------------------
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_LOAN_BASE
+    (
+        CUST_NUM                VARCHAR(20)     NOT NULL,
+        ACCT_NUM                VARCHAR(20)     NOT NULL,
+        DEAL_NUM                DECIMAL(20,0)   NOT NULL,
+        DEAL_SUB_NUM            DECIMAL(10,0)   NOT NULL,
+        DEAL_TYPE               VARCHAR(5)      NOT NULL,
+        LOAN_CCY                VARCHAR(3)      NOT NULL,
+        CURR_BAL                DECIMAL(18,2),
+        BREAK_INT_AMT           DECIMAL(18,2),
+        MATURITY_DATE           DATE,
+        RESP_COMP_CDE           VARCHAR(5),
+        COUNTRY_CODE            CHAR(2),
+        GUARANTEE_IND           CHAR(1),
+        RISK_RATING             DECIMAL(10,4),
+        PD                      DECIMAL(10,6),
+        LGD                     DECIMAL(10,6),
+        SOURCE_SYSTEM_ID        VARCHAR(20)
+    )
+    ON COMMIT PRESERVE ROWS NOT LOGGED WITH REPLACE;
+
+    INSERT INTO SESSION.TMP_LOAN_BASE
+    SELECT
+          l.CUST_NUM
+        , l.ACCT_NUM
+        , l.DEAL_NUM
+        , l.DEAL_SUB_NUM
+        , l.DEAL_TYPE
+        , l.LOAN_CCY
+        , l.CURR_BAL
+        , COALESCE(l.BREAK_INT_AMT, 0)
+        , l.MATURITY_DATE
+        , l.RESP_COMP_CDE
+        , l.COUNTRY_CODE
+        , CASE WHEN g.DEAL_NUM IS NOT NULL THEN 'Y' ELSE 'N' END AS GUARANTEE_IND
+        , COALESCE(rr.CUST_RISK_RATING, 0)
+        , COALESCE(rr.PD, 0)
+        , COALESCE(rr.LGD, 0)
+        , l.SOURCE_SYSTEM_ID
+    FROM INTERFACE.LOAN_DEAL l
+    LEFT JOIN INTERFACE.GUARANTEE_DEAL g
+           ON l.CUST_NUM     = g.CUST_NUM
+          AND l.ACCT_NUM     = g.ACCT_NUM
+          AND l.DEAL_NUM     = g.DEAL_NUM
+          AND l.DEAL_SUB_NUM = g.DEAL_SUB_NUM
+    LEFT JOIN INTERFACE.CUST_RISK_RATING rr
+           ON l.CUST_NUM = rr.CUST_NUM
+    WHERE l.ACTV_FLAG = 'A'
+      AND COALESCE(l.CURR_BAL, 0) <> 0
+      AND l.MATURITY_DATE >= l_report_date;
+
+    GET DIAGNOSTICS l_row_cnt = ROW_COUNT;
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+          'FORMAT'
+        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+        , 'INFO'
+        , 'TMP_LOAN_BASE inserted rows=' || CHAR(l_row_cnt)
+    );
+
+    ----------------------------------------------------------------
+    -- Temporary table: exchange rate
+    ----------------------------------------------------------------
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_FX_RATE
+    (
+        FROM_CCY       VARCHAR(3)    NOT NULL,
+        TO_CCY         VARCHAR(3)    NOT NULL,
+        RATE_DATE      DATE          NOT NULL,
+        EXCH_RATE      DECIMAL(18,8) NOT NULL
+    )
+    ON COMMIT PRESERVE ROWS NOT LOGGED WITH REPLACE;
+
+    INSERT INTO SESSION.TMP_FX_RATE
+    SELECT
+          f.FROM_CCY
+        , f.TO_CCY
+        , f.RATE_DATE
+        , f.EXCH_RATE
+    FROM INTERFACE.FX_RATE f
+    WHERE f.RATE_DATE = l_report_date
+      AND f.TO_CCY = l_reporting_ccy;
+
+    ----------------------------------------------------------------
+    -- Temporary table: guarantee enrich
+    ----------------------------------------------------------------
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_GUARANTEE
+    (
+        DEAL_NUM                DECIMAL(20,0) NOT NULL,
+        DEAL_SUB_NUM            DECIMAL(10,0) NOT NULL,
+        GUARANTEE_TYPE          VARCHAR(20),
+        GUARANTEE_VALUE         DECIMAL(18,2),
+        GUARANTEE_VALUE_RPT     DECIMAL(18,2),
+        GUARANTEE_CCY           VARCHAR(3)
+    )
+    ON COMMIT PRESERVE ROWS NOT LOGGED WITH REPLACE;
+
+    INSERT INTO SESSION.TMP_GUARANTEE
+    SELECT
+          g.DEAL_NUM
+        , g.DEAL_SUB_NUM
+        , g.GUARANTEE_TYPE
+        , g.GUARANTEE_AMT
+        , CASE
+              WHEN g.GUARANTEE_CCY = l_reporting_ccy
+                   THEN g.GUARANTEE_AMT
+              ELSE ROUND(g.GUARANTEE_AMT * COALESCE(fx.EXCH_RATE, 1), 2)
+          END AS GUARANTEE_VALUE_RPT
+        , g.GUARANTEE_CCY
+    FROM INTERFACE.GUARANTEE_DEAL g
+    LEFT JOIN SESSION.TMP_FX_RATE fx
+           ON g.GUARANTEE_CCY = fx.FROM_CCY
+          AND fx.TO_CCY       = l_reporting_ccy
+          AND fx.RATE_DATE    = l_report_date
+    WHERE g.ACTV_FLAG = 'A';
+
+    ----------------------------------------------------------------
+    -- Temporary table: charge / fee detail
+    ----------------------------------------------------------------
+    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_CHARGE
+    (
+        DEAL_NUM                DECIMAL(20,0) NOT NULL,
+        DEAL_SUB_NUM            DECIMAL(10,0) NOT NULL,
+        CHARGE_AMT              DECIMAL(18,2),
+        CHARGE_AMT_RPT          DECIMAL(18,2)
+    )
+    ON COMMIT PRESERVE ROWS NOT LOGGED WITH REPLACE;
+
+    INSERT INTO SESSION.TMP_CHARGE
+    SELECT
+          c.DEAL_NUM
+        , c.DEAL_SUB_NUM
+        , SUM(COALESCE(c.CHARGE_AMT, 0)) AS CHARGE_AMT
+        , SUM(
+            CASE
+                WHEN c.CHARGE_CCY = l_reporting_ccy
+                     THEN COALESCE(c.CHARGE_AMT, 0)
+                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)
+            END
+          ) AS CHARGE_AMT_RPT
+    FROM INTERFACE.SEC_CHARGE_DEAL c
+    LEFT JOIN SESSION.TMP_FX_RATE fx
+           ON c.CHARGE_CCY = fx.FROM_CCY
+          AND fx.TO_CCY    = l_reporting_ccy
+          AND fx.RATE_DATE = l_report_date
+    WHERE c.CHARGE_TYPE IN ('BROKER', 'TXN', 'COMM')
+    GROUP BY c.DEAL_NUM, c.DEAL_SUB_NUM;
+
+    ----------------------------------------------------------------
+    -- Main insert into report table
+    ----------------------------------------------------------------
+    INSERT INTO RPT.RPT_LOAN_RISK_DTL
+    (
+        BATCH_ID,
+        REPORT_DATE,
+        CUST_NUM,
+        ACCT_NUM,
+        DEAL_NUM,
+        DEAL_SUB_NUM,
+        DEAL_TYPE,
+        COUNTRY_CODE,
+        SOURCE_SYSTEM_ID,
+        LOAN_CCY,
+        CURR_BAL,
+        CURR_BAL_RPT,
+        BREAK_INT_AMT,
+        BREAK_INT_AMT_RPT,
+        GUARANTEE_IND,
+        GUARANTEE_TYPE,
+        GUARANTEE_VALUE,
+        GUARANTEE_VALUE_RPT,
+        RISK_RATING,
+        PD,
+        LGD,
+        EXPECTED_LOSS,
+        EXPECTED_LOSS_RPT,
+        CHARGE_AMT,
+        CHARGE_AMT_RPT,
+        MATURITY_DATE,
+        LOAD_TS
+    )
+    SELECT
+          l_batch_id
+        , l_report_date
+        , b.CUST_NUM
+        , b.ACCT_NUM
+        , b.DEAL_NUM
+        , b.DEAL_SUB_NUM
+        , b.DEAL_TYPE
+        , b.COUNTRY_CODE
+        , b.SOURCE_SYSTEM_ID
+        , b.LOAN_CCY
+        , b.CURR_BAL
+        , CASE
+              WHEN b.LOAN_CCY = l_reporting_ccy
+                   THEN b.CURR_BAL
+              ELSE ROUND(b.CURR_BAL * COALESCE(fx.EXCH_RATE, 1), 2)
+          END AS CURR_BAL_RPT
+        , b.BREAK_INT_AMT
+        , CASE
+              WHEN b.LOAN_CCY = l_reporting_ccy
+                   THEN b.BREAK_INT_AMT
+              ELSE ROUND(b.BREAK_INT_AMT * COALESCE(fx.EXCH_RATE, 1), 2)
+          END AS BREAK_INT_AMT_RPT
+        , b.GUARANTEE_IND
+        , g.GUARANTEE_TYPE
+        , g.GUARANTEE_VALUE
+        , g.GUARANTEE_VALUE_RPT
+        , b.RISK_RATING
+        , b.PD
+        , b.LGD
+        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS
+        , ROUND(
+            CASE
+                WHEN b.LOAN_CCY = l_reporting_ccy
+                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)
+                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)
+            END
+          , 2) AS EXPECTED_LOSS_RPT
+        , COALESCE(c.CHARGE_AMT, 0)
+        , COALESCE(c.CHARGE_AMT_RPT, 0)
+        , b.MATURITY_DATE
+        , CURRENT TIMESTAMP
+    FROM SESSION.TMP_LOAN_BASE b
+    LEFT JOIN SESSION.TMP_FX_RATE fx
+           ON b.LOAN_CCY   = fx.FROM_CCY
+          AND fx.TO_CCY    = l_reporting_ccy
+          AND fx.RATE_DATE = l_report_date
+    LEFT JOIN SESSION.TMP_GUARANTEE g
+           ON b.DEAL_NUM     = g.DEAL_NUM
+          AND b.DEAL_SUB_NUM = g.DEAL_SUB_NUM
+    LEFT JOIN SESSION.TMP_CHARGE c
+           ON b.DEAL_NUM     = c.DEAL_NUM
+          AND b.DEAL_SUB_NUM = c.DEAL_SUB_NUM;
+
+    GET DIAGNOSTICS l_row_cnt = ROW_COUNT;
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+          'FORMAT'
+        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+        , 'INFO'
+        , 'Main report inserted rows=' || CHAR(l_row_cnt)
+    );
+
+    ----------------------------------------------------------------
+    -- Post update: enrich sector / group mapping
+    ----------------------------------------------------------------
+    UPDATE RPT.RPT_LOAN_RISK_DTL r
+       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =
+           (
+               SELECT
+                     COALESCE(c.CUSTOMER_GROUP, 'UNKNOWN')
+                   , COALESCE(c.INDUSTRY_CODE, 'UNKNOWN')
+               FROM INTERFACE.CUST_PROFILE c
+               WHERE c.CUST_NUM = r.CUST_NUM
+               FETCH FIRST 1 ROW ONLY
+           )
+     WHERE EXISTS
+           (
+               SELECT 1
+               FROM INTERFACE.CUST_PROFILE c
+               WHERE c.CUST_NUM = r.CUST_NUM
+           )
+       AND r.BATCH_ID = l_batch_id;
+
+    ----------------------------------------------------------------
+    -- Optional logic controlled by config
+    ----------------------------------------------------------------
+    IF l_ctrl_flag = 'Y' THEN
+
+        UPDATE RPT.RPT_LOAN_RISK_DTL r
+           SET HIGH_RISK_FLAG =
+               CASE
+                   WHEN COALESCE(r.PD,0) >= 0.200000
+                     OR COALESCE(r.LGD,0) >= 0.700000
+                     OR COALESCE(r.EXPECTED_LOSS_RPT,0) >= 1000000
+                   THEN 'Y'
+                   ELSE 'N'
+               END
+         WHERE r.BATCH_ID = l_batch_id;
+
+        CALL TEMP.PR_PROCEDURE_LOG(
+              'FORMAT'
+            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+            , 'INFO'
+            , 'High risk flag updated'
+        );
+
+    END IF;
+
+    ----------------------------------------------------------------
+    -- Final commit
+    ----------------------------------------------------------------
+    COMMIT;
+
+    CALL TEMP.PR_PROCEDURE_LOG(
+          'FORMAT'
+        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'
+        , 'INFO'
+        , 'Procedure completed successfully. Batch=' || l_batch_id
+    );
+
+END
+@
+
+
+  
