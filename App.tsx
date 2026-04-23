@@ -1,718 +1,459 @@
-# relationship_detail.tsv — revised semantics and filling matrix (DB2-focused, schema-aware)
-
-This document is the **semantic contract** for generating and validating `relationship_detail.tsv`.
-
-It is intended to stay aligned with the current sample SQL and TSV, but it is **authoritative over the TSV** when the two diverge. Any mismatch between this document and a generated TSV should be treated as a defect in either:
-- the extractor / parser / post-processor, or
-- this contract itself.
-
-## Core principle
-
-Each row records **one direct, single-hop relationship** found in a source SQL object.
-
-The core meaning of a row must be readable from these main columns:
-- `source_object_type`
-- `source_object`
-- `source_field`
-- `target_object_type`
-- `target_object`
-- `target_field`
-- `relationship`
-- `line_no`
-- `line_relation_seq`
-- `line_content`
-
-`persistent_target_objects` and `intermediate_target_objects` are auxiliary **target-side classification** columns for the current direct relationship row. They indicate whether the row's target lands on a persistent target or an intermediate target. They do **not** represent full propagated lineage impact, do **not** represent a full intermediate path, and do **not** change the semantic meaning of the row.
-
-## General extraction rules
-
-### Directness
-Only emit **direct single-hop** relationships.
-Do **not** collapse multi-hop propagation into one row.
-
-Examples:
-- `A -> V1` and `V1 -> T1` are two direct rows, not one inferred `A -> T1` row.
-- `FUNCTION_EXPR_MAP` captures that a function result is used in an assignment expression; it does not replace argument lineage into the function itself.
-
-### Exact source fidelity
-- `line_no` must be the **exact physical source line number** from the SQL file.
-- `line_content` must be the **exact original raw source line** from the SQL file.
-- If a row's semantics are correct but the `line_no` or `line_content` is wrong, the row is still considered defective.
-
-### Schema-aware expansion
-The extractor may use schema/catalog metadata (DDL or live database metadata) to resolve:
-- object types
-- column ownership
-- `SELECT *` expansion
-- named function/procedure parameters
-- target-column alignment for `INSERT ... SELECT` and `MERGE`
-
-If required schema metadata is unavailable:
-- prefer a weaker but truthful row set,
-- or emit lower-confidence fallback rows,
-- but do **not** invent columns or parameter names.
-
-## Literal, special register, and system-value rule
-
-Ensure field-level lineage captures literals and DB2 system-derived values wherever they directly participate in SQL semantics.
-
-### Canonical token form
-Use:
-
-- `CONSTANT:<VALUE>` for literals and DB2 special registers/system constants  
-  Examples:
-  - `CONSTANT:'ACTIVE'`
-  - `CONSTANT:1`
-  - `CONSTANT:NULL`
-  - `CONSTANT:CURRENT TIMESTAMP`
-  - `CONSTANT:CURRENT DATE`
-  - `CONSTANT:USER`
-
-### Where literal/system tokens are allowed
-Literal/system tokens may appear in `source_field` for:
-- `SELECT_EXPR`
-- `INSERT_SELECT_MAP`
-- `UPDATE_SET`
-- `UPDATE_SET_MAP`
-- `MERGE_SET_MAP`
-- `MERGE_INSERT_MAP`
-- `VARIABLE_SET_MAP`
-- `FUNCTION_PARAM_MAP`
-- `CALL_PARAM_MAP`
-- `SPECIAL_REGISTER_MAP`
-- `DIAGNOSTICS_FETCH_MAP`
-- `RETURN_VALUE`
-- `WHERE`
-- `JOIN_ON`
-- `HAVING`
-- `CONTROL_FLOW_CONDITION`
-
-### Relationship choice precedence
-- Use `SPECIAL_REGISTER_MAP` for DB2 special-register assignment/mapping into a target column or variable when that is the most specific meaning.
-- Use `DIAGNOSTICS_FETCH_MAP` for diagnostic-state fetches.
-- Otherwise use the context-appropriate generic relationship (`INSERT_SELECT_MAP`, `UPDATE_SET_MAP`, `SELECT_EXPR`, `RETURN_VALUE`, etc.).
-
-## Column semantics
-
-### `source_object_type`
-Type of the SQL source object that owns the row.
-
-Common values:
-- `VIEW_DDL`
-- `FUNCTION`
-- `PROCEDURE`
-- `SCRIPT`
-
-### `source_object`
-Owning SQL object name.
-
-Examples:
-- `INTERFACE.V_API_MTM_REVAL`
-- `INTERFACE.FN_GET_CODE_MAP_VALUE`
-- `INTERFACE.PI_API_MTM_REVAL_DEMO`
-- `EXTRA_PATTERNS`
-
-### `source_field`
-Primary source-side token for field-level relationships.
-
-Rules:
-- Field-level rows: populate with the direct source or participating token.
-- Object-level rows: leave empty.
-- If the source is a literal or DB2 special register/system value, use `CONSTANT:<VALUE>`.
-- For callable-parameter mappings:
-  - `FUNCTION_PARAM_MAP` / `CALL_PARAM_MAP` use the actual argument token in `source_field`.
-- For `FUNCTION_EXPR_MAP`, use the called function name in `source_field`.
-
-### `target_object_type`
-Resolved object type on the right side of the direct relationship.
-
-Common values:
-- `TABLE`
-- `VIEW`
-- `SESSION_TABLE`
-- `CTE`
-- `FUNCTION`
-- `PROCEDURE`
-- `CURSOR`
-- `VARIABLE`
-- `UNKNOWN`
-
-### `target_object`
-Resolved object on the right side of the direct relationship.
-
-Rules:
-- Use the real resolved object whenever possible.
-- For unresolved placeholders, use a stable placeholder that matches the unresolved class:
-  - `UNKNOWN_DYNAMIC_SQL` for unresolved dynamic SQL text
-  - `UNKNOWN_UNSUPPORTED_STATEMENT` for unsupported but recognized statements such as utilities/admin commands
-  - `UNKNOWN_UNRESOLVED_OBJECT` for syntactically parseable cases whose real object cannot be resolved
-
-### `target_field`
-Resolved field / slot on the right side of the direct relationship.
-
-Rules:
-- Field-level rows: populate with the concrete target / participating field.
-- Object-level rows: leave empty.
-- For assignment-slot relationships (`UPDATE_SET`, `UPDATE_SET_MAP`, etc.), this is the target column or variable receiving the value.
-- For parameter-mapping relationships, use the **formal parameter name** when known; otherwise use a positional slot like `$1`, `$2`, ...
-
-### `relationship`
-One of the allowed relationship types defined below.
-
-### `line_no`
-Exact physical source line number.
-
-### `line_relation_seq`
-Stable per-line sequence number within the same source object.
-
-Rules:
-- Partition by (`source_object_type`, `source_object`, `line_no`)
-- Number from `0`
-- If a source line produces only one relationship row, use `0`
-- This is a **line-level** sequence only. It does **not** number the whole SQL statement across multiple lines.
-- The sequence must follow the **natural SQL relationship order on that line**, not a generic dictionary sort.
-
-Natural SQL ordering rules:
-1. Keep original left-to-right SQL appearance order whenever the line itself provides clear positional order.
-2. For ordered slot relationships, preserve statement slot order:
-   - `INSERT_TARGET_COL`: target-column declaration order inside `INSERT (...)`
-   - `INSERT_SELECT_MAP`, `TABLE_FUNCTION_RETURN_MAP`: select-item / mapping slot order
-   - `UPDATE_TARGET_COL`: `SET` target assignment order
-   - `UPDATE_SET_MAP`: target assignment order, then source-expression appearance order if more than one direct source participates
-   - `MERGE_TARGET_COL`, `MERGE_SET_MAP`, `MERGE_INSERT_MAP`: branch-local target / mapping slot order
-   - `CREATE_VIEW_MAP`: view select-list order
-   - `FUNCTION_PARAM_MAP`, `CALL_PARAM_MAP`: callable argument order
-   - `VARIABLE_SET_MAP`, `SPECIAL_REGISTER_MAP`, `DIAGNOSTICS_FETCH_MAP`, `FUNCTION_EXPR_MAP`: target assignment / slot order
-3. For direct field-usage and predicate rows, preserve token appearance order on the source line:
-   - `SELECT_FIELD`, `SELECT_EXPR`, `WHERE`, `JOIN_ON`, `GROUP_BY`, `HAVING`, `ORDER_BY`, `MERGE_MATCH`, `UPDATE_SET`, `CONTROL_FLOW_CONDITION`, `RETURN_VALUE`
-4. For object-level rows, preserve statement encounter order on that line:
-   - `SELECT_TABLE`, `SELECT_VIEW`, `INSERT_TABLE`, `UPDATE_TABLE`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `MERGE_INTO`, `CALL_FUNCTION`, `CALL_PROCEDURE`, `CTE_DEFINE`, `CTE_READ`, `UNION_INPUT`, `CREATE_VIEW`, `CREATE_TABLE`, `CREATE_PROCEDURE`, `CREATE_FUNCTION`, `UNKNOWN`, `CURSOR_DEFINE`, `CURSOR_READ`, `DYNAMIC_SQL_EXEC`, `EXCEPTION_HANDLER_MAP`
-5. Only use a deterministic fallback sort when the parser cannot recover meaningful natural order. In that fallback case, sort by:
-   `relationship`, `target_object_type`, `target_object`, `target_field`, `source_field`, `line_content`
-
-### `line_content`
-Exact original raw source line from the SQL file.
-
-### `persistent_target_objects`
-Auxiliary **target-side classification** column for the current direct relationship row.
-
-Meaning:
-- Identifies that the current row's **target side** is a persistent landing target.
-- This column does **not** mean full downstream impact.
-- This column does **not** mean the final propagated endpoint of a larger lineage chain.
-- This column does **not** replace mapping semantics in `relationship`.
-- This column does **not** connect separate direct rows together.
-
-Population rules:
-- Populate this column only when the current row's `target_object_type` is a persistent entity such as `TABLE` or `VIEW`, or `UNKNOWN` that truthfully represents a persistent target.
-- Treat this column primarily as a **target-landing tag**. It is most useful when the row itself already expresses a clear landing target.
-- **Preferred population cases:**
-  - mapping rows (`*_MAP`), because the row already means `source -> target`
-  - target-column declaration rows (`*_TARGET_COL`)
-  - object write / create rows such as `INSERT_TABLE`, `UPDATE_TABLE`, `MERGE_INTO`, `DELETE_TABLE`, `DELETE_VIEW`, `TRUNCATE_TABLE`, `CREATE_TABLE`, `CREATE_VIEW`, `CREATE_FUNCTION`, `CREATE_PROCEDURE`
-  - return / output rows when the target side is persistent
-- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than target landing. This includes:
-  - `SELECT_FIELD`
-  - `SELECT_EXPR`
-  - `WHERE`
-  - `JOIN_ON`
-  - `GROUP_BY`
-  - `HAVING`
-  - `ORDER_BY`
-  - `MERGE_MATCH`
-  - `UPDATE_SET`
-  - `CONTROL_FLOW_CONDITION`
-- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
-
-Format:
-- `target_object.target_field` when `target_field` is present
-- otherwise `target_object`
-
-### `intermediate_target_objects`
-Auxiliary **target-side classification** column for the current direct relationship row.
-
-Meaning:
-- Identifies that the current row's **target side** is an intermediate landing target such as a session table, CTE, variable, cursor, or parameter-like routine slot.
-- This column does **not** mean a full intermediate traversal path.
-- This column does **not** mean the complete set of intermediate steps between a source and a final persistent target.
-- This column does **not** replace mapping semantics in `relationship`.
-- This column does **not** connect separate direct rows together.
-
-Population rules:
-- Populate this column only when the current row's `target_object_type` is an intermediate entity such as `SESSION_TABLE`, `CTE`, `VARIABLE`, `CURSOR`, or `PROCEDURE` / `FUNCTION` when representing parameter assignments.
-- Treat this column primarily as a **target-landing tag** for intermediate structures.
-- **Preferred population cases:**
-  - mapping rows (`*_MAP`)
-  - target-column declaration rows when the declared target is intermediate
-  - structural rows such as `CTE_DEFINE`, `CTE_READ`, `CURSOR_DEFINE`, `CURSOR_READ`
-  - object write / create rows whose target is intermediate, such as `CREATE_TABLE` for session tables
-- **Usually leave empty for pure usage rows**, because they describe SQL usage context rather than intermediate landing. This includes:
-  - `SELECT_FIELD`
-  - `SELECT_EXPR`
-  - `WHERE`
-  - `JOIN_ON`
-  - `GROUP_BY`
-  - `HAVING`
-  - `ORDER_BY`
-  - `MERGE_MATCH`
-  - `UPDATE_SET`
-  - `CONTROL_FLOW_CONDITION`
-- If an implementation deliberately fills this column on usage rows for filtering convenience, treat that as optional auxiliary tagging only, not as stronger lineage semantics.
-
-Format:
-- `target_object.target_field` when `target_field` is present
-- otherwise `target_object`
-
-### `confidence`
-Extraction confidence.
-
-Allowed values:
-- `PARSER`
-- `REGEX`
-- `DYNAMIC_LOW_CONFIDENCE`
-
-## Stable output ordering
-
-For stable TSV generation, rows should be ordered primarily by:
-1. source-object traversal order
-2. source line order
-3. `line_relation_seq`
-
-When multiple rows come from the same (`source_object_type`, `source_object`, `line_no`) group, use the natural SQL ordering described above.
-
-## `SELECT *` expansion rule
-
-When SQL uses `SELECT *`, the extractor may expand `*` into concrete columns **only if**:
-- source schema metadata is available,
-- source column order is stable and known,
-- and the downstream mapping target can be aligned truthfully.
-
-If those conditions are not met:
-- emit only object-level read rows,
-- or emit lower-confidence fallback rows,
-- but do **not** fabricate field-level rows.
-
-## Callable parameter naming rule
-
-For both procedures and functions:
-- use the **formal parameter name** in `target_field` when callable signature metadata is available;
-- otherwise use positional slots `$1`, `$2`, ...;
-- do not mix named and positional styles for the same callable when the formal signature is known.
-
-## Relationship filling matrix
-
-### 1. Object-definition relationships
-
-#### `CREATE_VIEW`
-Meaning: defines a view object.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = created view
-- `target_field` = empty
-
-#### `CREATE_TABLE`
-Meaning: defines a table-like object, including DB2 session / DGTT-style table objects when applicable.
-- `source_field` = empty
-- `target_object_type` = resolved created object type
-- `target_object` = created object
-- `target_field` = empty
-
-#### `CREATE_PROCEDURE`
-Meaning: defines a stored procedure object.
-- `source_field` = empty
-- `target_object_type` = `PROCEDURE`
-- `target_object` = created procedure
-- `target_field` = empty
-
-#### `CREATE_FUNCTION`
-Meaning: defines a user-defined function object.
-- `source_field` = empty
-- `target_object_type` = `FUNCTION`
-- `target_object` = created function
-- `target_field` = empty
-
-### 2. Object-usage relationships
-
-#### `SELECT_TABLE`
-Meaning: statement directly reads a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE` or `SESSION_TABLE`
-- `target_object` = read object
-- `target_field` = empty
-
-#### `SELECT_VIEW`
-Meaning: statement directly reads a view.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = read view
-- `target_field` = empty
-
-#### `INSERT_TABLE`
-Meaning: statement inserts into an object.
-- `source_field` = empty
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = empty
-
-#### `UPDATE_TABLE`
-Meaning: statement updates an object.
-- `source_field` = empty
-- `target_object_type` = updated object type
-- `target_object` = updated object
-- `target_field` = empty
-
-#### `MERGE_INTO`
-Meaning: statement merges into an object.
-- `source_field` = empty
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = empty
-
-#### `DELETE_TABLE`
-Meaning: statement deletes from a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE`
-- `target_object` = deleted-from table
-- `target_field` = empty
-
-#### `DELETE_VIEW`
-Meaning: statement deletes from a view.
-- `source_field` = empty
-- `target_object_type` = `VIEW`
-- `target_object` = deleted-from view
-- `target_field` = empty
-
-#### `TRUNCATE_TABLE`
-Meaning: statement truncates a table.
-- `source_field` = empty
-- `target_object_type` = `TABLE`
-- `target_object` = truncated table
-- `target_field` = empty
-
-#### `CALL_FUNCTION`
-Meaning: statement directly invokes a function.
-- `source_field` = empty
-- `target_object_type` = `FUNCTION`
-- `target_object` = called function
-- `target_field` = empty
-
-#### `CALL_PROCEDURE`
-Meaning: statement directly invokes a procedure.
-- `source_field` = empty
-- `target_object_type` = `PROCEDURE`
-- `target_object` = called procedure
-- `target_field` = empty
-
-### 3. Target-column declaration relationships
-
-#### `INSERT_TARGET_COL`
-Meaning: an `INSERT (...)` target column slot is explicitly declared.
-- `source_field` = empty
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = declared target column
-- Emit this relationship only when the SQL text contains an explicit `INSERT (col1, col2, ...)` target-column list.
-
-#### `UPDATE_TARGET_COL`
-Meaning: a target column is assigned in an `UPDATE SET` clause.
-- `source_field` = empty
-- `target_object_type` = updated object type
-- `target_object` = updated object
-- `target_field` = target column being assigned
-
-#### `MERGE_TARGET_COL`
-Meaning: a target column is assigned in either branch of a `MERGE`.
-- `source_field` = empty
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column being updated or inserted
-
-### 4. Direct field-usage relationships
-
-#### `SELECT_FIELD`
-Meaning: a resolved field is directly projected in a `SELECT` list as a plain field projection, without additional expression wrapping.
-- `source_field` = projected field name
-- `target_object_type` = owning object type of that field
-- `target_object` = owning object
-- `target_field` = same resolved field
-
-#### `SELECT_EXPR`
-Meaning: a direct token participates in a `SELECT` expression or non-column select-list item.
-Use this for:
-- fields inside expressions
-- literals projected in the select list
-- special registers projected in the select list
-- computed expressions whose direct operands can be identified
-- `source_field` = participating token (field name or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-- `target_object` = owning object when applicable, otherwise a stable placeholder such as `UNKNOWN_SELECT_EXPR`
-- `target_field` = participating field when applicable, otherwise empty
-
-#### `UPDATE_SET`
-Meaning: a direct RHS token is used in an `UPDATE SET` assignment expression.
-- `source_field` = RHS participating token (field name or `CONSTANT:<VALUE>`)
-- `target_object_type` = updated target object type
-- `target_object` = updated target object
-- `target_field` = target column being assigned
-
-### 5. Field-mapping relationships (propagation-capable)
-
-**Precedence note:** More specific mappings take precedence over generic assignment mappings. Emit only the most specific relationship for the same direct semantic role.
-
-Specific relationships include:
-- `SPECIAL_REGISTER_MAP`
-- `DIAGNOSTICS_FETCH_MAP`
-- `FUNCTION_PARAM_MAP`
-- `CALL_PARAM_MAP`
-- `FUNCTION_EXPR_MAP`
-
-#### `CREATE_VIEW_MAP`
-Meaning: source column or direct literal maps into a created view column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = `VIEW`
-- `target_object` = target view
-- `target_field` = target view column
-
-#### `INSERT_SELECT_MAP`
-Meaning: source column or direct literal maps into an insert target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = insert target type
-- `target_object` = insert target
-- `target_field` = insert target column
-
-#### `UPDATE_SET_MAP`
-Meaning: source column or direct literal maps into an updated target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = updated target type
-- `target_object` = updated target
-- `target_field` = updated target column
-
-#### `MERGE_SET_MAP`
-Meaning: source column or direct literal maps into a `MERGE` matched-update target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column
-
-#### `MERGE_INSERT_MAP`
-Meaning: source column or direct literal maps into a `MERGE` insert-branch target column.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = merge target type
-- `target_object` = merge target
-- `target_field` = target column
-
-#### `VARIABLE_SET_MAP`
-Meaning: a source column, parameter, variable, literal, or direct expression operand is assigned into a declared variable.
-- `source_field` = direct source token or `CONSTANT:<VALUE>`
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable name
-
-#### `CURSOR_FETCH_MAP`
-Meaning: a source column from a cursor is mapped into a local variable or record slot during `FETCH` or implicit cursor iteration.
-- `source_field` = cursor column name
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable or record slot
-- Prefer qualified slot targets such as `V_REC.DEAL_NUM` when the target record structure is known.
-- If only the whole record variable is known, the record variable name may be used as a fallback.
-
-#### `FUNCTION_PARAM_MAP`
-Meaning: maps an actual argument into a called function's formal parameter.
-- `source_field` = actual argument token (field, variable, or `CONSTANT:<VALUE>`)
-- `target_object_type` = `FUNCTION`
-- `target_object` = called function
-- `target_field` = formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
-- Emit for scalar functions and table functions.
-
-#### `CALL_PARAM_MAP`
-Meaning: maps an actual argument into a called procedure parameter, or maps a procedure `OUT` / `INOUT` result into a receiving local variable.
-- `source_field` = actual argument token, or the procedure `OUT` / `INOUT` parameter token when receiving a returned value
-- `target_object_type` =
-  - `PROCEDURE` when passing into the callable
-  - `VARIABLE` when receiving an `OUT` / `INOUT` value locally
-- `target_object` =
-  - called procedure name when passing into the callable
-  - owning local routine when receiving the returned value
-- `target_field` =
-  - formal parameter name when known, otherwise positional slot `$1`, `$2`, ...
-  - or receiving local variable name for `OUT` / `INOUT` result capture
-
-#### `TABLE_FUNCTION_RETURN_MAP`
-Meaning: a source column or direct literal maps into a table-valued function `RETURN` table definition.
-- `source_field` = source column or `CONSTANT:<VALUE>`
-- `target_object_type` = `FUNCTION`
-- `target_object` = owning function
-- `target_field` = target return column
-
-#### `SPECIAL_REGISTER_MAP`
-Meaning: a DB2 special register is directly mapped into a target column or variable.
-- `source_field` = `CONSTANT:<SPECIAL_REGISTER>`
-- `target_object_type` = target object type (`TABLE`, `VIEW`, or `VARIABLE`)
-- `target_object` = target object
-- `target_field` = target column or variable
-
-#### `DIAGNOSTICS_FETCH_MAP`
-Meaning: diagnostic information such as `SQLCODE`, `SQLSTATE`, or `GET DIAGNOSTICS` properties is fetched into a local variable.
-- `source_field` = diagnostic token such as `CONSTANT:SQLSTATE`
-- `target_object_type` = `VARIABLE`
-- `target_object` = owning routine
-- `target_field` = receiving variable
-
-#### `FUNCTION_EXPR_MAP`
-Meaning: a function return value is used directly inside a field-level mapping expression.
-- `source_field` = called function name
-- `target_object_type` = target object type being modified
-- `target_object` = target object
-- `target_field` = target column or variable
-
-### 6. Predicate / condition relationships
-
-#### `WHERE`
-Meaning: a direct token participates in a `WHERE` predicate.
-- `source_field` = participating token (field or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning object type, or `CURSOR` for `WHERE CURRENT OF cursor_name`
-- `target_object` = owning object or cursor name
-- `target_field` = participating field when applicable, otherwise empty
-
-#### `JOIN_ON`
-Meaning: a direct token participates in a join condition.
-Same fill rule as `WHERE`.
-
-#### `MERGE_MATCH`
-Meaning: a direct token participates in the `MERGE ... ON ...` match condition.
-Same fill rule as `WHERE`.
-
-#### `GROUP_BY`
-Meaning: a direct field participates in grouping.
-Same fill rule as `WHERE`.
-
-#### `ORDER_BY`
-Meaning: a direct token participates in ordering.
-Same fill rule as `WHERE`.
-
-#### `HAVING`
-Meaning: a direct token participates in a `HAVING` predicate.
-
-Two valid forms are allowed:
-1. **Field-level / token-level** when a direct field or literal token can be resolved.
-   - `source_field` = participating token
-   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-   - `target_object` = owning object when applicable, otherwise `UNKNOWN_AGGREGATE`
-   - `target_field` = participating field when applicable, otherwise empty
-2. **Object-level fallback** when the expression has no stable direct token representation.
-   - `source_field` = empty
-   - `target_object_type` = owning object type or `UNKNOWN`
-   - `target_object` = owning object or `UNKNOWN_AGGREGATE`
-   - `target_field` = empty
-
-#### `CONTROL_FLOW_CONDITION`
-Meaning: a direct token participates in a procedural control-flow evaluation such as `IF`, `WHILE`, `CASE`, or `REPEAT`.
-- `source_field` = participating token (variable, field, or `CONSTANT:<VALUE>`)
-- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
-- `target_object` = owning routine
-- `target_field` = participating variable or field when applicable, otherwise empty
-
-### 7. Intermediate / structural relationships
-
-#### `CTE_DEFINE`
-Meaning: defines a CTE object.
-- `source_field` = empty
-- `target_object_type` = `CTE`
-- `target_object` = CTE name
-- `target_field` = empty
-
-#### `CTE_READ`
-Meaning: statement reads a CTE object.
-- `source_field` = empty
-- `target_object_type` = `CTE`
-- `target_object` = CTE name
-- `target_field` = empty
-
-#### `UNION_INPUT`
-Meaning: the current select branch contributes one direct object input to a `UNION` / `UNION ALL` chain.
-- `source_field` = empty
-- `target_object_type` = concrete input object type
-- `target_object` = concrete input object
-- `target_field` = empty
-
-#### `CURSOR_DEFINE`
-Meaning: defines a named cursor and its associated `SELECT`.
-- `source_field` = empty
-- `target_object_type` = `CURSOR`
-- `target_object` = cursor name
-- `target_field` = empty
-
-#### `CURSOR_READ`
-Meaning: statement explicitly opens, fetches from, closes, or otherwise reads from a cursor.
-- `source_field` = empty
-- `target_object_type` = `CURSOR`
-- `target_object` = cursor name
-- `target_field` = empty
-
-#### `EXCEPTION_HANDLER_MAP`
-Meaning: an exception handler explicitly captures or redirects control flow/state based on an error condition.
-- `source_field` = caught condition token such as `CONSTANT:SQLEXCEPTION`, `CONSTANT:NOT FOUND`, `CONSTANT:'02000'`
-- `target_object_type` = owning routine type (`PROCEDURE` or `FUNCTION`)
-- `target_object` = owning routine
-- `target_field` = empty
-
-### 8. Return / execution relationships
-
-#### `RETURN_VALUE`
-Meaning: direct operand-level dependency of a **scalar** function `RETURN` expression.
-For table-valued functions, use `TABLE_FUNCTION_RETURN_MAP` instead.
-
-Valid forms:
-1. **Operand-level token dependency**
-   - `source_field` = direct operand token (field, variable, or `CONSTANT:<VALUE>`)
-   - `target_object_type` = owning object type when applicable, otherwise `UNKNOWN`
-   - `target_object` = owning object when applicable, otherwise `UNKNOWN_RETURN_EXPR`
-   - `target_field` = participating field / variable when applicable, otherwise empty
-2. **Callable dependency**
-   - `source_field` = empty
-   - `target_object_type` = `FUNCTION`
-   - `target_object` = called function
-   - `target_field` = empty
-
-Examples:
-- `RETURN P_FACTOR * 2;` may emit:
-  - operand row for `P_FACTOR`
-  - operand row for `CONSTANT:2`
-- `RETURN MY_FUNC(V_X);` may emit:
-  - callable dependency row to `MY_FUNC`
-  - plus `FUNCTION_PARAM_MAP` rows for `V_X -> MY_FUNC.<param>`
-
-#### `DYNAMIC_SQL_EXEC`
-Meaning: a variable or literal containing dynamic SQL is executed, such as `EXECUTE IMMEDIATE`.
-- `source_field` = participating variable or string literal
-- `target_object_type` = `UNKNOWN`
-- `target_object` = `UNKNOWN_DYNAMIC_SQL`
-- `target_field` = empty
-
-### 9. Unknown / unresolved relationships
-
-#### `UNKNOWN`
-Meaning: a direct statement exists but cannot yet be expressed as a stronger supported relationship.
-- `source_field` = empty unless a direct unresolved token is important for review
-- `target_object_type` = `UNKNOWN`
-- `target_object` = one of:
-  - `UNKNOWN_UNSUPPORTED_STATEMENT`
-  - `UNKNOWN_UNRESOLVED_OBJECT`
-  - another stable, truthful placeholder of the same class
-- `target_field` = empty
-
-## Optional validation guidance
-
-A validator should flag at least these defect classes:
-- invalid header
-- invalid relationship value
-- invalid confidence value
-- duplicate rows
-- inconsistent `line_relation_seq` within a line group
-- `line_no` not matching the real SQL file
-- `line_content` not matching the real SQL file
-- rows that violate explicit contract rules such as:
-  - `INSERT_TARGET_COL` emitted without an explicit target-column list
-  - `SELECT_FIELD` emitted for a literal projection
-  - mixed named and positional parameter targets for the same callable when the signature is known
+source_object_type	source_object	source_field	target_object_type	target_object	target_field	relationship	line_no	line_relation_seq	line_content	confidence
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		CREATE_PROCEDURE	1	0	CREATE PROCEDURE TEMP.PR_EXTRACT_LOAN_RISK_DTL ()	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'00000'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_site_code	VARIABLE_SET_MAP	28	0	    DECLARE l_site_code             CHAR(5) DEFAULT '00000';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	VARIABLE_SET_MAP	34	0	    DECLARE l_ctrl_flag             CHAR(1) DEFAULT 'N';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	VARIABLE_SET_MAP	35	0	    DECLARE l_row_cnt               INTEGER DEFAULT 0;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:SQLEXCEPTION	PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	EXIT	EXCEPTION_HANDLER_MAP	42	0	    DECLARE EXIT HANDLER FOR SQLEXCEPTION	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:MESSAGE_TEXT	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_err_msg	DIAGNOSTICS_FETCH_MAP	44	0	        GET DIAGNOSTICS EXCEPTION 1 l_err_msg = MESSAGE_TEXT;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	46	0	        CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	47	0	              'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	48	0	            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'ERROR'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	49	0	            , 'ERROR'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_err_msg	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_err_msg	SELECT_EXPR	50	0	            , COALESCE(l_err_msg, 'UNKNOWN SQL EXCEPTION')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN SQL EXCEPTION'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	50	1	            , COALESCE(l_err_msg, 'UNKNOWN SQL EXCEPTION')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_err_msg	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	50	2	            , COALESCE(l_err_msg, 'UNKNOWN SQL EXCEPTION')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN SQL EXCEPTION'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	50	3	            , COALESCE(l_err_msg, 'UNKNOWN SQL EXCEPTION')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	RESIGNAL	SIGNAL_CONDITION	54	0	        RESIGNAL;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:NOT FOUND	PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONTINUE	EXCEPTION_HANDLER_MAP	57	0	    DECLARE CONTINUE HANDLER FOR NOT FOUND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'NOT FOUND CONDITION ENCOUNTERED'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_warn_msg	VARIABLE_SET_MAP	59	0	        SET l_warn_msg = 'NOT FOUND CONDITION ENCOUNTERED';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	60	0	        CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	61	0	              'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	62	0	            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'WARN'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	63	0	            , 'WARN'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_warn_msg	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	64	0	            , l_warn_msg	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT DATE	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	71	0	    SET l_report_date        = CURRENT DATE - 1 DAY;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1 DAY	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	71	1	    SET l_report_date        = CURRENT DATE - 1 DAY;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT DATE	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE_SET_MAP	71	2	    SET l_report_date        = CURRENT DATE - 1 DAY;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1 DAY	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE_SET_MAP	71	3	    SET l_report_date        = CURRENT DATE - 1 DAY;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT DATE	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_next_business_date	SPECIAL_REGISTER_MAP	72	0	    SET l_next_business_date = CURRENT DATE;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'HK'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_country_code	VARIABLE_SET_MAP	73	0	    SET l_country_code       = 'HK';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'HKD'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE_SET_MAP	74	0	    SET l_reporting_ccy      = 'HKD';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_is_hk	VARIABLE_SET_MAP	75	0	    SET l_is_hk              = 'Y';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_is_sg	VARIABLE_SET_MAP	76	0	    SET l_is_sg              = 'N';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		FUNCTION	VARCHAR_FORMAT		CALL_FUNCTION	77	0	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT TIMESTAMP	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	77	1	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'YYYYMMDDHH24MISS'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	77	2	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	VARCHAR_FORMAT	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	FUNCTION_EXPR_MAP	77	3	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT TIMESTAMP	FUNCTION	VARCHAR_FORMAT	$1	FUNCTION_PARAM_MAP	77	4	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'YYYYMMDDHH24MISS'	FUNCTION	VARCHAR_FORMAT	$2	FUNCTION_PARAM_MAP	77	5	    SET l_batch_id           = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS');	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	79	0	    CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	80	0	          'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	81	0	        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	82	0	        , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Procedure started. Batch='	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	83	0	        , 'Procedure started. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	SELECT_EXPR	83	1	        , 'Procedure started. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Procedure started. Batch='	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	83	2	        , 'Procedure started. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	83	3	        , 'Procedure started. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CTRL_FLAG	TABLE	CFG.RPT_CONTROL	CTRL_FLAG	SELECT_EXPR	89	0	    SELECT COALESCE(MAX(ctrl_flag), 'N')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	89	1	    SELECT COALESCE(MAX(ctrl_flag), 'N')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	FUNCTION_EXPR_MAP	90	0	      INTO l_ctrl_flag	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CTRL_FLAG	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	VARIABLE_SET_MAP	90	1	      INTO l_ctrl_flag	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	VARIABLE_SET_MAP	90	2	      INTO l_ctrl_flag	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	CFG.RPT_CONTROL		SELECT_TABLE	91	0	      FROM CFG.RPT_CONTROL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	PROCESS_NAME	TABLE	CFG.RPT_CONTROL	PROCESS_NAME	WHERE	92	0	     WHERE process_name = 'PR_EXTRACT_LOAN_RISK_DTL';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'PR_EXTRACT_LOAN_RISK_DTL'	TABLE	CFG.RPT_CONTROL	PROCESS_NAME	WHERE	92	1	     WHERE process_name = 'PR_EXTRACT_LOAN_RISK_DTL';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'ALTER TABLE RPT.RPT_LOAN_RISK_DTL ACTIVATE NOT LOGGED INITIALLY WITH EMPTY TABLE'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_sql_str	VARIABLE_SET_MAP	97	0	    SET l_sql_str =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_sql_str	UNKNOWN	UNKNOWN_DYNAMIC_SQL	EXECUTE_IMMEDIATE	DYNAMIC_SQL_EXEC	100	0	    EXECUTE IMMEDIATE l_sql_str;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL		TRUNCATE_TABLE	100	1	    EXECUTE IMMEDIATE l_sql_str;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	103	0	    CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	104	0	          'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	105	0	        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	106	0	        , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Target table cleared'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	107	0	        , 'Target table cleared'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_LOAN_BASE		CREATE_TABLE	113	0	    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_LOAN_BASE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CUST_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CUST_NUM	INSERT_SELECT_MAP	115	0	        CUST_NUM                VARCHAR(20)     NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.ACCT_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	ACCT_NUM	INSERT_SELECT_MAP	116	0	        ACCT_NUM                VARCHAR(20)     NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_NUM	INSERT_SELECT_MAP	117	0	        DEAL_NUM                DECIMAL(20,0)   NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_SUB_NUM	INSERT_SELECT_MAP	118	0	        DEAL_SUB_NUM            DECIMAL(10,0)   NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_TYPE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_TYPE	INSERT_SELECT_MAP	119	0	        DEAL_TYPE               VARCHAR(5)      NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	INSERT_SELECT_MAP	120	0	        LOAN_CCY                VARCHAR(3)      NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	INSERT_SELECT_MAP	121	0	        CURR_BAL                DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	FUNCTION_EXPR_MAP	122	0	        BREAK_INT_AMT           DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.BREAK_INT_AMT	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	INSERT_SELECT_MAP	122	1	        BREAK_INT_AMT           DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	INSERT_SELECT_MAP	122	2	        BREAK_INT_AMT           DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.MATURITY_DATE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	MATURITY_DATE	INSERT_SELECT_MAP	123	0	        MATURITY_DATE           DATE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.RESP_COMP_CDE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	RESP_COMP_CDE	INSERT_SELECT_MAP	124	0	        RESP_COMP_CDE           VARCHAR(5),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.COUNTRY_CODE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	COUNTRY_CODE	INSERT_SELECT_MAP	125	0	        COUNTRY_CODE            CHAR(2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	SESSION_TABLE	SESSION.TMP_LOAN_BASE	GUARANTEE_IND	INSERT_SELECT_MAP	126	0	        GUARANTEE_IND           CHAR(1),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	SESSION_TABLE	SESSION.TMP_LOAN_BASE	GUARANTEE_IND	INSERT_SELECT_MAP	126	1	        GUARANTEE_IND           CHAR(1),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	RISK_RATING	FUNCTION_EXPR_MAP	127	0	        RISK_RATING             DECIMAL(10,4),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.CUST_RISK_RATING	SESSION_TABLE	SESSION.TMP_LOAN_BASE	RISK_RATING	INSERT_SELECT_MAP	127	1	        RISK_RATING             DECIMAL(10,4),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_LOAN_BASE	RISK_RATING	INSERT_SELECT_MAP	127	2	        RISK_RATING             DECIMAL(10,4),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	FUNCTION_EXPR_MAP	128	0	        PD                      DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.PD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	INSERT_SELECT_MAP	128	1	        PD                      DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	INSERT_SELECT_MAP	128	2	        PD                      DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	FUNCTION_EXPR_MAP	129	0	        LGD                     DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.LGD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	INSERT_SELECT_MAP	129	1	        LGD                     DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	INSERT_SELECT_MAP	129	2	        LGD                     DECIMAL(10,6),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.SOURCE_SYSTEM_ID	SESSION_TABLE	SESSION.TMP_LOAN_BASE	SOURCE_SYSTEM_ID	INSERT_SELECT_MAP	130	0	        SOURCE_SYSTEM_ID        VARCHAR(20)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_LOAN_BASE		INSERT_TABLE	134	0	    INSERT INTO SESSION.TMP_LOAN_BASE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CUST_NUM	TABLE	INTERFACE.LOAN_DEAL	CUST_NUM	SELECT_FIELD	136	0	          l.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.ACCT_NUM	TABLE	INTERFACE.LOAN_DEAL	ACCT_NUM	SELECT_FIELD	137	0	        , l.ACCT_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_NUM	TABLE	INTERFACE.LOAN_DEAL	DEAL_NUM	SELECT_FIELD	138	0	        , l.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_SUB_NUM	TABLE	INTERFACE.LOAN_DEAL	DEAL_SUB_NUM	SELECT_FIELD	139	0	        , l.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_TYPE	TABLE	INTERFACE.LOAN_DEAL	DEAL_TYPE	SELECT_FIELD	140	0	        , l.DEAL_TYPE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.LOAN_CCY	TABLE	INTERFACE.LOAN_DEAL	LOAN_CCY	SELECT_FIELD	141	0	        , l.LOAN_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CURR_BAL	TABLE	INTERFACE.LOAN_DEAL	CURR_BAL	SELECT_FIELD	142	0	        , l.CURR_BAL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.BREAK_INT_AMT	TABLE	INTERFACE.LOAN_DEAL	BREAK_INT_AMT	SELECT_EXPR	143	0	        , COALESCE(l.BREAK_INT_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	143	1	        , COALESCE(l.BREAK_INT_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.MATURITY_DATE	TABLE	INTERFACE.LOAN_DEAL	MATURITY_DATE	SELECT_FIELD	144	0	        , l.MATURITY_DATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.RESP_COMP_CDE	TABLE	INTERFACE.LOAN_DEAL	RESP_COMP_CDE	SELECT_FIELD	145	0	        , l.RESP_COMP_CDE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.COUNTRY_CODE	TABLE	INTERFACE.LOAN_DEAL	COUNTRY_CODE	SELECT_FIELD	146	0	        , l.COUNTRY_CODE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	DEAL_NUM	SELECT_EXPR	147	0	        , CASE WHEN g.DEAL_NUM IS NOT NULL THEN 'Y' ELSE 'N' END AS GUARANTEE_IND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:NULL	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	147	1	        , CASE WHEN g.DEAL_NUM IS NOT NULL THEN 'Y' ELSE 'N' END AS GUARANTEE_IND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	147	2	        , CASE WHEN g.DEAL_NUM IS NOT NULL THEN 'Y' ELSE 'N' END AS GUARANTEE_IND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	147	3	        , CASE WHEN g.DEAL_NUM IS NOT NULL THEN 'Y' ELSE 'N' END AS GUARANTEE_IND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.CUST_RISK_RATING	TABLE	INTERFACE.CUST_RISK_RATING	CUST_RISK_RATING	SELECT_EXPR	148	0	        , COALESCE(rr.CUST_RISK_RATING, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	148	1	        , COALESCE(rr.CUST_RISK_RATING, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.PD	TABLE	INTERFACE.CUST_RISK_RATING	PD	SELECT_EXPR	149	0	        , COALESCE(rr.PD, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	149	1	        , COALESCE(rr.PD, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.LGD	TABLE	INTERFACE.CUST_RISK_RATING	LGD	SELECT_EXPR	150	0	        , COALESCE(rr.LGD, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	150	1	        , COALESCE(rr.LGD, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.SOURCE_SYSTEM_ID	TABLE	INTERFACE.LOAN_DEAL	SOURCE_SYSTEM_ID	SELECT_FIELD	151	0	        , l.SOURCE_SYSTEM_ID	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.LOAN_DEAL		SELECT_TABLE	152	0	    FROM INTERFACE.LOAN_DEAL l	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.GUARANTEE_DEAL		SELECT_TABLE	153	0	    LEFT JOIN INTERFACE.GUARANTEE_DEAL g	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CUST_NUM	TABLE	INTERFACE.LOAN_DEAL	CUST_NUM	JOIN_ON	154	0	           ON l.CUST_NUM     = g.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.CUST_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	CUST_NUM	JOIN_ON	154	1	           ON l.CUST_NUM     = g.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.ACCT_NUM	TABLE	INTERFACE.LOAN_DEAL	ACCT_NUM	JOIN_ON	155	0	          AND l.ACCT_NUM     = g.ACCT_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.ACCT_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	ACCT_NUM	JOIN_ON	155	1	          AND l.ACCT_NUM     = g.ACCT_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_NUM	TABLE	INTERFACE.LOAN_DEAL	DEAL_NUM	JOIN_ON	156	0	          AND l.DEAL_NUM     = g.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	DEAL_NUM	JOIN_ON	156	1	          AND l.DEAL_NUM     = g.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.DEAL_SUB_NUM	TABLE	INTERFACE.LOAN_DEAL	DEAL_SUB_NUM	JOIN_ON	157	0	          AND l.DEAL_SUB_NUM = g.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_SUB_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	DEAL_SUB_NUM	JOIN_ON	157	1	          AND l.DEAL_SUB_NUM = g.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.CUST_RISK_RATING		SELECT_TABLE	158	0	    LEFT JOIN INTERFACE.CUST_RISK_RATING rr	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CUST_NUM	TABLE	INTERFACE.LOAN_DEAL	CUST_NUM	JOIN_ON	159	0	           ON l.CUST_NUM = rr.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	rr.CUST_NUM	TABLE	INTERFACE.CUST_RISK_RATING	CUST_NUM	JOIN_ON	159	1	           ON l.CUST_NUM = rr.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.ACTV_FLAG	TABLE	INTERFACE.LOAN_DEAL	ACTV_FLAG	WHERE	160	0	    WHERE l.ACTV_FLAG = 'A'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'A'	TABLE	INTERFACE.LOAN_DEAL	ACTV_FLAG	WHERE	160	1	    WHERE l.ACTV_FLAG = 'A'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.CURR_BAL	TABLE	INTERFACE.LOAN_DEAL	CURR_BAL	WHERE	161	0	      AND COALESCE(l.CURR_BAL, 0) <> 0	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	INTERFACE.LOAN_DEAL	CURR_BAL	WHERE	161	1	      AND COALESCE(l.CURR_BAL, 0) <> 0	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	INTERFACE.LOAN_DEAL	CURR_BAL	WHERE	161	2	      AND COALESCE(l.CURR_BAL, 0) <> 0	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l.MATURITY_DATE	TABLE	INTERFACE.LOAN_DEAL	MATURITY_DATE	WHERE	162	0	      AND l.MATURITY_DATE >= l_report_date;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	WHERE	162	1	      AND l.MATURITY_DATE >= l_report_date;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:ROW_COUNT	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	DIAGNOSTICS_FETCH_MAP	164	0	    GET DIAGNOSTICS l_row_cnt = ROW_COUNT;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	166	0	    CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	167	0	          'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	168	0	        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	169	0	        , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TMP_LOAN_BASE inserted rows='	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	170	0	        , 'TMP_LOAN_BASE inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	SELECT_EXPR	170	1	        , 'TMP_LOAN_BASE inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TMP_LOAN_BASE inserted rows='	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	170	2	        , 'TMP_LOAN_BASE inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	170	3	        , 'TMP_LOAN_BASE inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_FX_RATE		CREATE_TABLE	176	0	    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_FX_RATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.FROM_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	FROM_CCY	INSERT_SELECT_MAP	178	0	        FROM_CCY       VARCHAR(3)    NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.TO_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	TO_CCY	INSERT_SELECT_MAP	179	0	        TO_CCY         VARCHAR(3)    NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.RATE_DATE	SESSION_TABLE	SESSION.TMP_FX_RATE	RATE_DATE	INSERT_SELECT_MAP	180	0	        RATE_DATE      DATE          NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	INSERT_SELECT_MAP	181	0	        EXCH_RATE      DECIMAL(18,8) NOT NULL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_FX_RATE		INSERT_TABLE	185	0	    INSERT INTO SESSION.TMP_FX_RATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.FROM_CCY	TABLE	INTERFACE.FX_RATE	FROM_CCY	SELECT_FIELD	187	0	          f.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.TO_CCY	TABLE	INTERFACE.FX_RATE	TO_CCY	SELECT_FIELD	188	0	        , f.TO_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.RATE_DATE	TABLE	INTERFACE.FX_RATE	RATE_DATE	SELECT_FIELD	189	0	        , f.RATE_DATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.EXCH_RATE	TABLE	INTERFACE.FX_RATE	EXCH_RATE	SELECT_FIELD	190	0	        , f.EXCH_RATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.FX_RATE		SELECT_TABLE	191	0	    FROM INTERFACE.FX_RATE f	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.RATE_DATE	TABLE	INTERFACE.FX_RATE	RATE_DATE	WHERE	192	0	    WHERE f.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	WHERE	192	1	    WHERE f.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	f.TO_CCY	TABLE	INTERFACE.FX_RATE	TO_CCY	WHERE	193	0	      AND f.TO_CCY = l_reporting_ccy;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	WHERE	193	1	      AND f.TO_CCY = l_reporting_ccy;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_GUARANTEE		CREATE_TABLE	198	0	    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_GUARANTEE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_NUM	SESSION_TABLE	SESSION.TMP_GUARANTEE	DEAL_NUM	INSERT_SELECT_MAP	200	0	        DEAL_NUM                DECIMAL(20,0) NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_GUARANTEE	DEAL_SUB_NUM	INSERT_SELECT_MAP	201	0	        DEAL_SUB_NUM            DECIMAL(10,0) NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_TYPE	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_TYPE	INSERT_SELECT_MAP	202	0	        GUARANTEE_TYPE          VARCHAR(20),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE	INSERT_SELECT_MAP	203	0	        GUARANTEE_VALUE         DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE_RPT	INSERT_SELECT_MAP	204	0	        GUARANTEE_VALUE_RPT     DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE_RPT	INSERT_SELECT_MAP	204	1	        GUARANTEE_VALUE_RPT     DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE_RPT	INSERT_SELECT_MAP	204	2	        GUARANTEE_VALUE_RPT     DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE_RPT	INSERT_SELECT_MAP	204	3	        GUARANTEE_VALUE_RPT     DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_CCY	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_CCY	INSERT_SELECT_MAP	205	0	        GUARANTEE_CCY           VARCHAR(3)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_GUARANTEE		INSERT_TABLE	209	0	    INSERT INTO SESSION.TMP_GUARANTEE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	DEAL_NUM	SELECT_FIELD	211	0	          g.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_SUB_NUM	TABLE	INTERFACE.GUARANTEE_DEAL	DEAL_SUB_NUM	SELECT_FIELD	212	0	        , g.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_TYPE	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_TYPE	SELECT_FIELD	213	0	        , g.GUARANTEE_TYPE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_AMT	SELECT_FIELD	214	0	        , g.GUARANTEE_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_CCY	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_CCY	SELECT_EXPR	216	0	              WHEN g.GUARANTEE_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	SELECT_EXPR	216	1	              WHEN g.GUARANTEE_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_AMT	SELECT_EXPR	217	0	                   THEN g.GUARANTEE_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_AMT	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_AMT	SELECT_EXPR	218	0	              ELSE ROUND(g.GUARANTEE_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	SELECT_EXPR	218	1	              ELSE ROUND(g.GUARANTEE_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	218	2	              ELSE ROUND(g.GUARANTEE_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	218	3	              ELSE ROUND(g.GUARANTEE_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_CCY	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_CCY	SELECT_FIELD	220	0	        , g.GUARANTEE_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.GUARANTEE_DEAL		SELECT_TABLE	221	0	    FROM INTERFACE.GUARANTEE_DEAL g	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_FX_RATE		SELECT_TABLE	222	0	    LEFT JOIN SESSION.TMP_FX_RATE fx	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_CCY	TABLE	INTERFACE.GUARANTEE_DEAL	GUARANTEE_CCY	JOIN_ON	223	0	           ON g.GUARANTEE_CCY = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.FROM_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	FROM_CCY	JOIN_ON	223	1	           ON g.GUARANTEE_CCY = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.TO_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	TO_CCY	JOIN_ON	224	0	          AND fx.TO_CCY       = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	JOIN_ON	224	1	          AND fx.TO_CCY       = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.RATE_DATE	SESSION_TABLE	SESSION.TMP_FX_RATE	RATE_DATE	JOIN_ON	225	0	          AND fx.RATE_DATE    = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	JOIN_ON	225	1	          AND fx.RATE_DATE    = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.ACTV_FLAG	TABLE	INTERFACE.GUARANTEE_DEAL	ACTV_FLAG	WHERE	226	0	    WHERE g.ACTV_FLAG = 'A';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'A'	TABLE	INTERFACE.GUARANTEE_DEAL	ACTV_FLAG	WHERE	226	1	    WHERE g.ACTV_FLAG = 'A';	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_CHARGE		CREATE_TABLE	231	0	    DECLARE GLOBAL TEMPORARY TABLE SESSION.TMP_CHARGE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_NUM	SESSION_TABLE	SESSION.TMP_CHARGE	DEAL_NUM	INSERT_SELECT_MAP	233	0	        DEAL_NUM                DECIMAL(20,0) NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_CHARGE	DEAL_SUB_NUM	INSERT_SELECT_MAP	234	0	        DEAL_SUB_NUM            DECIMAL(10,0) NOT NULL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	SUM	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT	FUNCTION_EXPR_MAP	235	0	        CHARGE_AMT              DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT	INSERT_SELECT_MAP	235	1	        CHARGE_AMT              DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT	INSERT_SELECT_MAP	235	2	        CHARGE_AMT              DECIMAL(18,2),	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	SUM	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	FUNCTION_EXPR_MAP	236	0	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	1	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	2	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	3	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	4	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	5	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	INSERT_SELECT_MAP	236	6	        CHARGE_AMT_RPT          DECIMAL(18,2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_CHARGE		INSERT_TABLE	240	0	    INSERT INTO SESSION.TMP_CHARGE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_NUM	TABLE	INTERFACE.SEC_CHARGE_DEAL	DEAL_NUM	SELECT_FIELD	242	0	          c.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_SUB_NUM	TABLE	INTERFACE.SEC_CHARGE_DEAL	DEAL_SUB_NUM	SELECT_FIELD	243	0	        , c.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_AMT	SELECT_EXPR	244	0	        , SUM(COALESCE(c.CHARGE_AMT, 0)) AS CHARGE_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	244	1	        , SUM(COALESCE(c.CHARGE_AMT, 0)) AS CHARGE_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_CCY	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_CCY	SELECT_EXPR	247	0	                WHEN c.CHARGE_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	SELECT_EXPR	247	1	                WHEN c.CHARGE_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_AMT	SELECT_EXPR	248	0	                     THEN COALESCE(c.CHARGE_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	248	1	                     THEN COALESCE(c.CHARGE_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_AMT	SELECT_EXPR	249	0	                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	249	1	                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	SELECT_EXPR	249	2	                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	249	3	                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	249	4	                ELSE ROUND(COALESCE(c.CHARGE_AMT, 0) * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.SEC_CHARGE_DEAL		SELECT_TABLE	252	0	    FROM INTERFACE.SEC_CHARGE_DEAL c	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_FX_RATE		SELECT_TABLE	253	0	    LEFT JOIN SESSION.TMP_FX_RATE fx	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_CCY	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_CCY	JOIN_ON	254	0	           ON c.CHARGE_CCY = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.FROM_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	FROM_CCY	JOIN_ON	254	1	           ON c.CHARGE_CCY = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.TO_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	TO_CCY	JOIN_ON	255	0	          AND fx.TO_CCY    = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	JOIN_ON	255	1	          AND fx.TO_CCY    = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.RATE_DATE	SESSION_TABLE	SESSION.TMP_FX_RATE	RATE_DATE	JOIN_ON	256	0	          AND fx.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	JOIN_ON	256	1	          AND fx.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_TYPE	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_TYPE	WHERE	257	0	    WHERE c.CHARGE_TYPE IN ('BROKER', 'TXN', 'COMM')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'BROKER'	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_TYPE	WHERE	257	1	    WHERE c.CHARGE_TYPE IN ('BROKER', 'TXN', 'COMM')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TXN'	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_TYPE	WHERE	257	2	    WHERE c.CHARGE_TYPE IN ('BROKER', 'TXN', 'COMM')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'COMM'	TABLE	INTERFACE.SEC_CHARGE_DEAL	CHARGE_TYPE	WHERE	257	3	    WHERE c.CHARGE_TYPE IN ('BROKER', 'TXN', 'COMM')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_NUM	TABLE	INTERFACE.SEC_CHARGE_DEAL	DEAL_NUM	GROUP_BY	258	0	    GROUP BY c.DEAL_NUM, c.DEAL_SUB_NUM;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_SUB_NUM	TABLE	INTERFACE.SEC_CHARGE_DEAL	DEAL_SUB_NUM	GROUP_BY	258	1	    GROUP BY c.DEAL_NUM, c.DEAL_SUB_NUM;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL		INSERT_TABLE	263	0	    INSERT INTO RPT.RPT_LOAN_RISK_DTL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	BATCH_ID	INSERT_TARGET_COL	265	0	        BATCH_ID,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	TABLE	RPT.RPT_LOAN_RISK_DTL	BATCH_ID	INSERT_SELECT_MAP	265	1	        BATCH_ID,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	REPORT_DATE	INSERT_TARGET_COL	266	0	        REPORT_DATE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	TABLE	RPT.RPT_LOAN_RISK_DTL	REPORT_DATE	INSERT_SELECT_MAP	266	1	        REPORT_DATE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CUST_NUM	INSERT_TARGET_COL	267	0	        CUST_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CUST_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	CUST_NUM	INSERT_SELECT_MAP	267	1	        CUST_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	ACCT_NUM	INSERT_TARGET_COL	268	0	        ACCT_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.ACCT_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	ACCT_NUM	INSERT_SELECT_MAP	268	1	        ACCT_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_NUM	INSERT_TARGET_COL	269	0	        DEAL_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_NUM	INSERT_SELECT_MAP	269	1	        DEAL_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_SUB_NUM	INSERT_TARGET_COL	270	0	        DEAL_SUB_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_SUB_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_SUB_NUM	INSERT_SELECT_MAP	270	1	        DEAL_SUB_NUM,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_TYPE	INSERT_TARGET_COL	271	0	        DEAL_TYPE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_TYPE	TABLE	RPT.RPT_LOAN_RISK_DTL	DEAL_TYPE	INSERT_SELECT_MAP	271	1	        DEAL_TYPE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	COUNTRY_CODE	INSERT_TARGET_COL	272	0	        COUNTRY_CODE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.COUNTRY_CODE	TABLE	RPT.RPT_LOAN_RISK_DTL	COUNTRY_CODE	INSERT_SELECT_MAP	272	1	        COUNTRY_CODE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	SOURCE_SYSTEM_ID	INSERT_TARGET_COL	273	0	        SOURCE_SYSTEM_ID,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.SOURCE_SYSTEM_ID	TABLE	RPT.RPT_LOAN_RISK_DTL	SOURCE_SYSTEM_ID	INSERT_SELECT_MAP	273	1	        SOURCE_SYSTEM_ID,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	LOAN_CCY	INSERT_TARGET_COL	274	0	        LOAN_CCY,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	TABLE	RPT.RPT_LOAN_RISK_DTL	LOAN_CCY	INSERT_SELECT_MAP	274	1	        LOAN_CCY,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL	INSERT_TARGET_COL	275	0	        CURR_BAL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL	INSERT_SELECT_MAP	275	1	        CURR_BAL,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL_RPT	INSERT_TARGET_COL	276	0	        CURR_BAL_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL_RPT	INSERT_SELECT_MAP	276	1	        CURR_BAL_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL_RPT	INSERT_SELECT_MAP	276	2	        CURR_BAL_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL_RPT	INSERT_SELECT_MAP	276	3	        CURR_BAL_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	TABLE	RPT.RPT_LOAN_RISK_DTL	CURR_BAL_RPT	INSERT_SELECT_MAP	276	4	        CURR_BAL_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT	INSERT_TARGET_COL	277	0	        BREAK_INT_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT	INSERT_SELECT_MAP	277	1	        BREAK_INT_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT_RPT	INSERT_TARGET_COL	278	0	        BREAK_INT_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT_RPT	INSERT_SELECT_MAP	278	1	        BREAK_INT_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT_RPT	INSERT_SELECT_MAP	278	2	        BREAK_INT_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT_RPT	INSERT_SELECT_MAP	278	3	        BREAK_INT_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	TABLE	RPT.RPT_LOAN_RISK_DTL	BREAK_INT_AMT_RPT	INSERT_SELECT_MAP	278	4	        BREAK_INT_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_IND	INSERT_TARGET_COL	279	0	        GUARANTEE_IND,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.GUARANTEE_IND	TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_IND	INSERT_SELECT_MAP	279	1	        GUARANTEE_IND,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_TYPE	INSERT_TARGET_COL	280	0	        GUARANTEE_TYPE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_TYPE	TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_TYPE	INSERT_SELECT_MAP	280	1	        GUARANTEE_TYPE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_VALUE	INSERT_TARGET_COL	281	0	        GUARANTEE_VALUE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_VALUE	TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_VALUE	INSERT_SELECT_MAP	281	1	        GUARANTEE_VALUE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_VALUE_RPT	INSERT_TARGET_COL	282	0	        GUARANTEE_VALUE_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_VALUE_RPT	TABLE	RPT.RPT_LOAN_RISK_DTL	GUARANTEE_VALUE_RPT	INSERT_SELECT_MAP	282	1	        GUARANTEE_VALUE_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	RISK_RATING	INSERT_TARGET_COL	283	0	        RISK_RATING,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.RISK_RATING	TABLE	RPT.RPT_LOAN_RISK_DTL	RISK_RATING	INSERT_SELECT_MAP	283	1	        RISK_RATING,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	PD	INSERT_TARGET_COL	284	0	        PD,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	TABLE	RPT.RPT_LOAN_RISK_DTL	PD	INSERT_SELECT_MAP	284	1	        PD,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	LGD	INSERT_TARGET_COL	285	0	        LGD,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	TABLE	RPT.RPT_LOAN_RISK_DTL	LGD	INSERT_SELECT_MAP	285	1	        LGD,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_TARGET_COL	286	0	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	ROUND	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	FUNCTION_EXPR_MAP	286	1	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	2	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	3	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	4	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	5	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	6	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS	INSERT_SELECT_MAP	286	7	        EXPECTED_LOSS,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_TARGET_COL	287	0	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	ROUND	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	FUNCTION_EXPR_MAP	287	1	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	2	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	3	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	4	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	5	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	6	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	7	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	8	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	9	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	10	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	11	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	12	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	13	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	14	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	TABLE	RPT.RPT_LOAN_RISK_DTL	EXPECTED_LOSS_RPT	INSERT_SELECT_MAP	287	15	        EXPECTED_LOSS_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT	INSERT_TARGET_COL	288	0	        CHARGE_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT	FUNCTION_EXPR_MAP	288	1	        CHARGE_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT	INSERT_SELECT_MAP	288	2	        CHARGE_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT	INSERT_SELECT_MAP	288	3	        CHARGE_AMT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT_RPT	INSERT_TARGET_COL	289	0	        CHARGE_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT_RPT	FUNCTION_EXPR_MAP	289	1	        CHARGE_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT_RPT	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT_RPT	INSERT_SELECT_MAP	289	2	        CHARGE_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	CHARGE_AMT_RPT	INSERT_SELECT_MAP	289	3	        CHARGE_AMT_RPT,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	MATURITY_DATE	INSERT_TARGET_COL	290	0	        MATURITY_DATE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.MATURITY_DATE	TABLE	RPT.RPT_LOAN_RISK_DTL	MATURITY_DATE	INSERT_SELECT_MAP	290	1	        MATURITY_DATE,	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	LOAD_TS	INSERT_TARGET_COL	291	0	        LOAD_TS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT TIMESTAMP	TABLE	RPT.RPT_LOAN_RISK_DTL	LOAD_TS	SPECIAL_REGISTER_MAP	291	1	        LOAD_TS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	SELECT_EXPR	294	0	          l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	SELECT_EXPR	295	0	        , l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CUST_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CUST_NUM	SELECT_FIELD	296	0	        , b.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.ACCT_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	ACCT_NUM	SELECT_FIELD	297	0	        , b.ACCT_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_NUM	SELECT_FIELD	298	0	        , b.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_SUB_NUM	SELECT_FIELD	299	0	        , b.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_TYPE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_TYPE	SELECT_FIELD	300	0	        , b.DEAL_TYPE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.COUNTRY_CODE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	COUNTRY_CODE	SELECT_FIELD	301	0	        , b.COUNTRY_CODE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.SOURCE_SYSTEM_ID	SESSION_TABLE	SESSION.TMP_LOAN_BASE	SOURCE_SYSTEM_ID	SELECT_FIELD	302	0	        , b.SOURCE_SYSTEM_ID	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	SELECT_FIELD	303	0	        , b.LOAN_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_FIELD	304	0	        , b.CURR_BAL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	SELECT_EXPR	306	0	              WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	SELECT_EXPR	306	1	              WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_EXPR	307	0	                   THEN b.CURR_BAL	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_EXPR	308	0	              ELSE ROUND(b.CURR_BAL * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	SELECT_EXPR	308	1	              ELSE ROUND(b.CURR_BAL * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	308	2	              ELSE ROUND(b.CURR_BAL * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	308	3	              ELSE ROUND(b.CURR_BAL * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	SELECT_FIELD	310	0	        , b.BREAK_INT_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	SELECT_EXPR	312	0	              WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	SELECT_EXPR	312	1	              WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	SELECT_EXPR	313	0	                   THEN b.BREAK_INT_AMT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.BREAK_INT_AMT	SESSION_TABLE	SESSION.TMP_LOAN_BASE	BREAK_INT_AMT	SELECT_EXPR	314	0	              ELSE ROUND(b.BREAK_INT_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	SELECT_EXPR	314	1	              ELSE ROUND(b.BREAK_INT_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	314	2	              ELSE ROUND(b.BREAK_INT_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	314	3	              ELSE ROUND(b.BREAK_INT_AMT * COALESCE(fx.EXCH_RATE, 1), 2)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.GUARANTEE_IND	SESSION_TABLE	SESSION.TMP_LOAN_BASE	GUARANTEE_IND	SELECT_FIELD	316	0	        , b.GUARANTEE_IND	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_TYPE	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_TYPE	SELECT_FIELD	317	0	        , g.GUARANTEE_TYPE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_VALUE	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE	SELECT_FIELD	318	0	        , g.GUARANTEE_VALUE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.GUARANTEE_VALUE_RPT	SESSION_TABLE	SESSION.TMP_GUARANTEE	GUARANTEE_VALUE_RPT	SELECT_FIELD	319	0	        , g.GUARANTEE_VALUE_RPT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.RISK_RATING	SESSION_TABLE	SESSION.TMP_LOAN_BASE	RISK_RATING	SELECT_FIELD	320	0	        , b.RISK_RATING	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	SELECT_FIELD	321	0	        , b.PD	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	SELECT_FIELD	322	0	        , b.LGD	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_EXPR	323	0	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	323	1	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	SELECT_EXPR	323	2	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	323	3	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	SELECT_EXPR	323	4	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	323	5	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	323	6	        , ROUND(COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0), 2) AS EXPECTED_LOSS	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	SELECT_EXPR	326	0	                WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	SELECT_EXPR	326	1	                WHEN b.LOAN_CCY = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_EXPR	327	0	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	327	1	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	SELECT_EXPR	327	2	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	327	3	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	SELECT_EXPR	327	4	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	327	5	                     THEN COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.CURR_BAL	SESSION_TABLE	SESSION.TMP_LOAN_BASE	CURR_BAL	SELECT_EXPR	328	0	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	328	1	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.PD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	PD	SELECT_EXPR	328	2	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	328	3	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LGD	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LGD	SELECT_EXPR	328	4	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	328	5	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.EXCH_RATE	SESSION_TABLE	SESSION.TMP_FX_RATE	EXCH_RATE	SELECT_EXPR	328	6	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	328	7	                ELSE COALESCE(b.CURR_BAL,0) * COALESCE(b.PD,0) * COALESCE(b.LGD,0) * COALESCE(fx.EXCH_RATE,1)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:2	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	330	0	          , 2) AS EXPECTED_LOSS_RPT	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT	SELECT_EXPR	331	0	        , COALESCE(c.CHARGE_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	331	1	        , COALESCE(c.CHARGE_AMT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CHARGE_AMT_RPT	SESSION_TABLE	SESSION.TMP_CHARGE	CHARGE_AMT_RPT	SELECT_EXPR	332	0	        , COALESCE(c.CHARGE_AMT_RPT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	332	1	        , COALESCE(c.CHARGE_AMT_RPT, 0)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.MATURITY_DATE	SESSION_TABLE	SESSION.TMP_LOAN_BASE	MATURITY_DATE	SELECT_FIELD	333	0	        , b.MATURITY_DATE	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:CURRENT TIMESTAMP	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	334	0	        , CURRENT TIMESTAMP	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_LOAN_BASE		SELECT_TABLE	335	0	    FROM SESSION.TMP_LOAN_BASE b	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_FX_RATE		SELECT_TABLE	336	0	    LEFT JOIN SESSION.TMP_FX_RATE fx	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.LOAN_CCY	SESSION_TABLE	SESSION.TMP_LOAN_BASE	LOAN_CCY	JOIN_ON	337	0	           ON b.LOAN_CCY   = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.FROM_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	FROM_CCY	JOIN_ON	337	1	           ON b.LOAN_CCY   = fx.FROM_CCY	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.TO_CCY	SESSION_TABLE	SESSION.TMP_FX_RATE	TO_CCY	JOIN_ON	338	0	          AND fx.TO_CCY    = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_reporting_ccy	JOIN_ON	338	1	          AND fx.TO_CCY    = l_reporting_ccy	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	fx.RATE_DATE	SESSION_TABLE	SESSION.TMP_FX_RATE	RATE_DATE	JOIN_ON	339	0	          AND fx.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_report_date	JOIN_ON	339	1	          AND fx.RATE_DATE = l_report_date	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_GUARANTEE		SELECT_TABLE	340	0	    LEFT JOIN SESSION.TMP_GUARANTEE g	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_NUM	JOIN_ON	341	0	           ON b.DEAL_NUM     = g.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_NUM	SESSION_TABLE	SESSION.TMP_GUARANTEE	DEAL_NUM	JOIN_ON	341	1	           ON b.DEAL_NUM     = g.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_SUB_NUM	JOIN_ON	342	0	          AND b.DEAL_SUB_NUM = g.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	g.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_GUARANTEE	DEAL_SUB_NUM	JOIN_ON	342	1	          AND b.DEAL_SUB_NUM = g.DEAL_SUB_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		SESSION_TABLE	SESSION.TMP_CHARGE		SELECT_TABLE	343	0	    LEFT JOIN SESSION.TMP_CHARGE c	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_NUM	JOIN_ON	344	0	           ON b.DEAL_NUM     = c.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_NUM	SESSION_TABLE	SESSION.TMP_CHARGE	DEAL_NUM	JOIN_ON	344	1	           ON b.DEAL_NUM     = c.DEAL_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	b.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_LOAN_BASE	DEAL_SUB_NUM	JOIN_ON	345	0	          AND b.DEAL_SUB_NUM = c.DEAL_SUB_NUM;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.DEAL_SUB_NUM	SESSION_TABLE	SESSION.TMP_CHARGE	DEAL_SUB_NUM	JOIN_ON	345	1	          AND b.DEAL_SUB_NUM = c.DEAL_SUB_NUM;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:ROW_COUNT	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	DIAGNOSTICS_FETCH_MAP	347	0	    GET DIAGNOSTICS l_row_cnt = ROW_COUNT;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	349	0	    CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	350	0	          'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	351	0	        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	352	0	        , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Main report inserted rows='	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	353	0	        , 'Main report inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	SELECT_EXPR	353	1	        , 'Main report inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Main report inserted rows='	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	353	2	        , 'Main report inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_row_cnt	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	353	3	        , 'Main report inserted rows=' || CHAR(l_row_cnt)	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL		UPDATE_TABLE	359	0	    UPDATE RPT.RPT_LOAN_RISK_DTL r	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	CUSTOMER_GROUP	UPDATE_TARGET_COL	360	0	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	INDUSTRY_CODE	UPDATE_TARGET_COL	360	1	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	TABLE	RPT.RPT_LOAN_RISK_DTL	CUSTOMER_GROUP	FUNCTION_EXPR_MAP	360	2	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	COALESCE	TABLE	RPT.RPT_LOAN_RISK_DTL	INDUSTRY_CODE	FUNCTION_EXPR_MAP	360	3	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CUSTOMER_GROUP	TABLE	RPT.RPT_LOAN_RISK_DTL	CUSTOMER_GROUP	UPDATE_SET_MAP	360	4	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN'	TABLE	RPT.RPT_LOAN_RISK_DTL	CUSTOMER_GROUP	UPDATE_SET_MAP	360	5	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.INDUSTRY_CODE	TABLE	RPT.RPT_LOAN_RISK_DTL	INDUSTRY_CODE	UPDATE_SET_MAP	360	6	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN'	TABLE	RPT.RPT_LOAN_RISK_DTL	INDUSTRY_CODE	UPDATE_SET_MAP	360	7	       SET (CUSTOMER_GROUP, INDUSTRY_CODE) =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CUSTOMER_GROUP	TABLE	INTERFACE.CUST_PROFILE	CUSTOMER_GROUP	SELECT_EXPR	363	0	                     COALESCE(c.CUSTOMER_GROUP, 'UNKNOWN')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	363	1	                     COALESCE(c.CUSTOMER_GROUP, 'UNKNOWN')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.INDUSTRY_CODE	TABLE	INTERFACE.CUST_PROFILE	INDUSTRY_CODE	SELECT_EXPR	364	0	                   , COALESCE(c.INDUSTRY_CODE, 'UNKNOWN')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'UNKNOWN'	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	364	1	                   , COALESCE(c.INDUSTRY_CODE, 'UNKNOWN')	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.CUST_PROFILE		SELECT_TABLE	365	0	               FROM INTERFACE.CUST_PROFILE c	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CUST_NUM	TABLE	INTERFACE.CUST_PROFILE	CUST_NUM	WHERE	366	0	               WHERE c.CUST_NUM = r.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.CUST_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	CUST_NUM	WHERE	366	1	               WHERE c.CUST_NUM = r.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	371	0	               SELECT 1	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	INTERFACE.CUST_PROFILE		SELECT_TABLE	372	0	               FROM INTERFACE.CUST_PROFILE c	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	c.CUST_NUM	TABLE	INTERFACE.CUST_PROFILE	CUST_NUM	WHERE	373	0	               WHERE c.CUST_NUM = r.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.CUST_NUM	TABLE	RPT.RPT_LOAN_RISK_DTL	CUST_NUM	WHERE	373	1	               WHERE c.CUST_NUM = r.CUST_NUM	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.BATCH_ID	TABLE	RPT.RPT_LOAN_RISK_DTL	BATCH_ID	WHERE	375	0	       AND r.BATCH_ID = l_batch_id;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	WHERE	375	1	       AND r.BATCH_ID = l_batch_id;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_ctrl_flag	CONTROL_FLOW_CONDITION	380	0	    IF l_ctrl_flag = 'Y' THEN	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		CONTROL_FLOW_CONDITION	380	1	    IF l_ctrl_flag = 'Y' THEN	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL		UPDATE_TABLE	382	0	        UPDATE RPT.RPT_LOAN_RISK_DTL r	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_TARGET_COL	383	0	           SET HIGH_RISK_FLAG =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET_MAP	383	1	           SET HIGH_RISK_FLAG =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET_MAP	383	2	           SET HIGH_RISK_FLAG =	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.PD	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	385	0	                   WHEN COALESCE(r.PD,0) >= 0.200000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	385	1	                   WHEN COALESCE(r.PD,0) >= 0.200000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0.200000	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	385	2	                   WHEN COALESCE(r.PD,0) >= 0.200000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.LGD	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	386	0	                     OR COALESCE(r.LGD,0) >= 0.700000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	386	1	                     OR COALESCE(r.LGD,0) >= 0.700000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0.700000	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	386	2	                     OR COALESCE(r.LGD,0) >= 0.700000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.EXPECTED_LOSS_RPT	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	387	0	                     OR COALESCE(r.EXPECTED_LOSS_RPT,0) >= 1000000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:0	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	387	1	                     OR COALESCE(r.EXPECTED_LOSS_RPT,0) >= 1000000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:1000000	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	387	2	                     OR COALESCE(r.EXPECTED_LOSS_RPT,0) >= 1000000	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Y'	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	388	0	                   THEN 'Y'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'N'	TABLE	RPT.RPT_LOAN_RISK_DTL	HIGH_RISK_FLAG	UPDATE_SET	389	0	                   ELSE 'N'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	r.BATCH_ID	TABLE	RPT.RPT_LOAN_RISK_DTL	BATCH_ID	WHERE	391	0	         WHERE r.BATCH_ID = l_batch_id;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	WHERE	391	1	         WHERE r.BATCH_ID = l_batch_id;	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	393	0	        CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	394	0	              'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	395	0	            , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	396	0	            , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'High risk flag updated'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	397	0	            , 'High risk flag updated'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_PROCEDURE_LOG		CALL_PROCEDURE	407	0	    CALL TEMP.PR_PROCEDURE_LOG(	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'FORMAT'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$1	CALL_PARAM_MAP	408	0	          'FORMAT'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$2	CALL_PARAM_MAP	409	0	        , 'TEMP.PR_EXTRACT_LOAN_RISK_DTL'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'INFO'	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$3	CALL_PARAM_MAP	410	0	        , 'INFO'	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Procedure completed successfully. Batch='	UNKNOWN	UNKNOWN_SELECT_EXPR		SELECT_EXPR	411	0	        , 'Procedure completed successfully. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	SELECT_EXPR	411	1	        , 'Procedure completed successfully. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'Procedure completed successfully. Batch='	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	411	2	        , 'Procedure completed successfully. Batch=' || l_batch_id	PARSER
+PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_batch_id	PROCEDURE	TEMP.PR_PROCEDURE_LOG	$4	CALL_PARAM_MAP	411	3	        , 'Procedure completed successfully. Batch=' || l_batch_id	PARSER
