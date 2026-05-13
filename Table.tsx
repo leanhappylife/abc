@@ -1,3 +1,15 @@
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.27.3</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+
+
 CREATE PROCEDURE RPT.PR_TEST_DEMO
 (
     IN p_product_type VARCHAR(2),
