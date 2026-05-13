@@ -1,3 +1,14 @@
+
+Get-ChildItem -Recurse -Include *.java |
+Select-String -Pattern "import\s+com\.amazonaws|com\.amazonaws\." -CaseSensitive:$false
+
+
+Get-ChildItem -Recurse -Include *.java |
+Select-String -Pattern "AmazonS3|AmazonSQS|AmazonSNS|AWSCredentials|DefaultAWSCredentials|AWSStaticCredentialsProvider|AmazonWebServiceClient" -CaseSensitive:$false
+
+
+
+
 source_object_type	source_object	source_field	target_object_type	target_object	target_field	relationship	line_no	line_relation_seq	line_content	confidence
 PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL		CREATE_PROCEDURE	1	0	CREATE PROCEDURE TEMP.PR_EXTRACT_LOAN_RISK_DTL ()	PARSER
 PROCEDURE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	CONSTANT:'00000'	VARIABLE	TEMP.PR_EXTRACT_LOAN_RISK_DTL	l_site_code	VARIABLE_SET_MAP	28	0	    DECLARE l_site_code             CHAR(5) DEFAULT '00000';	PARSER
