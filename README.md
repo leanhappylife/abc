@@ -11,6 +11,15 @@
 }
 
 
+<properties>
+    <java.version>17</java.version>
+    <revision>DEV-SNAPSHOT</revision>
+    <spring-security.version>6.3.9</spring-security.version>
+    <common-lib.version>2.0.0</common-lib.version>
+    ...
+</properties>
+
+
 export GITHUB_TOKEN="ghp_你的token"
 export GITHUB_ENTERPRISE_URL="https://github.your-company.com/api/v3"
 export DEBUG=true          # 可选，开启调试
