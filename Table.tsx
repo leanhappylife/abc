@@ -9,6 +9,18 @@
 </dependencyManagement>
 
 
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.util.IOUtils;
+
+Get-ChildItem -Recurse -Include *.java,*.xml,*.yml,*.yaml,*.properties |
+Select-String -Pattern "com.amazonaws|AmazonS3|AmazonSQS|AmazonSNS|AWSCredentials|DefaultAWSCredentials|AWSStaticCredentialsProvider|aws-java-sdk|aws\." -CaseSensitive:$false
+
+
+
+
+
+
 
 <dependencyManagement>
     <dependencies>
