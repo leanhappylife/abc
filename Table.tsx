@@ -10,6 +10,29 @@
 
 
 
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+            <version>6.3.9</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.27.3</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.xmlunit</groupId>
+            <artifactId>xmlunit-core</artifactId>
+            <version>2.10.4</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+
 CREATE PROCEDURE RPT.PR_TEST_DEMO
 (
     IN p_product_type VARCHAR(2),
