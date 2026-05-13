@@ -18,5 +18,5 @@ export LANGUAGE=en         # 或 ko（韩语）
 启动服务器：
 Bashnpm run dev
 
-
+mvn -U -pl :cmt-common-entitlement-ikurus-common-client -am dependency:tree "-Dincludes=org.springframework.security:spring-security-crypto" "-Dverbose"
 请使用 github-enterprise 的 get_repository 工具，获取仓库 owner/repo 的详细信息
