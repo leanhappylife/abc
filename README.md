@@ -18,6 +18,19 @@ export LANGUAGE=en         # 或 ko（韩语）
 启动服务器：
 Bashnpm run dev
 
+
+<properties>
+    <java.version>17</java.version>
+    <revision>DEV-SNAPSHOT</revision>
+    <spring-security.version>6.3.9</spring-security.version>
+    <common-lib.version>2.0.0</common-lib.version>
+    ...
+</properties>
+
+
+
+
+
 <properties>
     <java.version>17</java.version>
     <revision>DEV-SNAPSHOT</revision>
