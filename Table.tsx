@@ -9,6 +9,17 @@
 </dependencyManagement>
 
 
+
+Get-ChildItem -Recurse -Include *.java |
+Select-String -Pattern "import\s+com\.amazonaws|com\.amazonaws\." -CaseSensitive:$false
+
+
+Get-ChildItem -Recurse -Include *.java |
+Select-String -Pattern "AmazonS3|AmazonSQS|AmazonSNS|AWSCredentials|DefaultAWSCredentials|AWSStaticCredentialsProvider|AmazonWebServiceClient" -CaseSensitive:$false
+
+
+
+
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.util.IOUtils;
