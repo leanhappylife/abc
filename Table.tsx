@@ -16,6 +16,8 @@ import com.amazonaws.util.IOUtils;
 Get-ChildItem -Recurse -Include *.java,*.xml,*.yml,*.yaml,*.properties |
 Select-String -Pattern "com.amazonaws|AmazonS3|AmazonSQS|AmazonSNS|AWSCredentials|DefaultAWSCredentials|AWSStaticCredentialsProvider|aws-java-sdk|aws\." -CaseSensitive:$false
 
+mvn -U -pl :cmt-common-entitlement-service-server -am dependency:tree "-Dincludes=com.amazonaws:aws-java-sdk-core" "-Dverbose"
+
 
 
 
